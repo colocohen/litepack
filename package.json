@@ -1,0 +1,65 @@
+{
+  "name": "litepack",
+  "version": "1.0.0",
+  "description": "📦 Lightweight binary schema encoding - define a schema, encode to bytes, decode back. Zero dependencies.",
+  "main": "./litepack.js",
+  "module": "./litepack.mjs",
+  "types": "./litepack.d.ts",
+  "browser": "./litepack.js",
+  "exports": {
+    ".": {
+      "import": "./litepack.mjs",
+      "require": "./litepack.js",
+      "types": "./litepack.d.ts",
+      "browser": "./litepack.js"
+    }
+  },
+  "files": [
+    "litepack.js",
+    "litepack.mjs",
+    "litepack.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "binary",
+    "schema",
+    "encode",
+    "decode",
+    "pack",
+    "unpack",
+    "serialize",
+    "deserialize",
+    "varint",
+    "struct",
+    "bitfield",
+    "enum",
+    "compact",
+    "lightweight",
+    "protocol",
+    "wire-format",
+    "msgpack",
+    "protobuf",
+    "cbor",
+    "nodejs",
+    "isomorphic"
+  ],
+  "author": "colocohen",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/litepack.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/litepack/issues"
+  },
+  "homepage": "https://github.com/colocohen/litepack#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ],
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>litepack — Schema Builder & Tester</title>
+<script src="litepack.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#F4F1EC;--bg-card:#FFF;--bg-in:#F9F8F6;--bg-code:#F0EDE7;--bg-hex:#2B2B2B;--tx:#1A1A1A;--tx2:#6B6560;--txm:#9B9590;--bd:#DDD8D0;--bdf:#1A1A1A;--ac:#C05430;--acl:#F5E6DE;--acd:#8B3A1F;--ok:#2D7A4F;--okl:#E0F0E8;--wn:#B8860B;--wnl:#FDF5E0;--sh:0 1px 3px rgba(0,0,0,.06);--r:6px;--rl:10px}
+body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg);color:var(--tx);line-height:1.5}
+.hd{background:var(--bg-card);border-bottom:1px solid var(--bd);padding:14px 24px;display:flex;align-items:center;gap:14px}
+.hd h1{font-family:'IBM Plex Mono',monospace;font-size:19px;font-weight:600;letter-spacing:-.5px}
+.hd h1 span{color:var(--ac)}
+.hd .sub{font-size:12px;color:var(--txm);border-left:1px solid var(--bd);padding-left:14px}
+.main{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:18px 24px;max-width:1600px;margin:0 auto}
+@media(max-width:1100px){.main{grid-template-columns:1fr}}
+.card{background:var(--bg-card);border:1px solid var(--bd);border-radius:var(--rl);box-shadow:var(--sh);overflow:hidden;margin-bottom:18px}
+.card-h{padding:11px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;background:var(--bg-in)}
+.card-h h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--tx2)}
+.card-b{padding:16px}
+input,select,textarea{font-family:inherit;font-size:12px;border:1px solid var(--bd);border-radius:var(--r);padding:6px 9px;background:var(--bg-in);color:var(--tx);outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--bdf)}
+textarea{font-family:'IBM Plex Mono',monospace;font-size:11px;resize:vertical;line-height:1.5}
+.btn{font-family:inherit;font-size:11px;font-weight:600;border:1px solid var(--bd);border-radius:var(--r);padding:5px 11px;cursor:pointer;transition:all .15s;background:var(--bg-card);color:var(--tx);display:inline-flex;align-items:center;gap:4px}
+.btn:hover{background:var(--bg)}
+.btn-p{background:var(--ac);color:#fff;border-color:var(--acd)}.btn-p:hover{background:var(--acd)}
+.btn-sm{padding:3px 8px;font-size:10px}
+.btn-x{color:var(--ac);border:none;padding:1px 5px;font-size:15px;line-height:1;cursor:pointer;background:none}.btn-x:hover{background:var(--acl);border-radius:3px}
+.fr{display:flex;align-items:center;gap:5px;padding:4px 0;border-bottom:1px solid #f0ede7;flex-wrap:wrap}
+.fr:last-child{border-bottom:none}
+.fr input.fn{font-family:'IBM Plex Mono',monospace;font-size:11px;width:120px;padding:3px 6px}
+.fr select{font-size:11px;padding:3px 6px}
+.fr label{font-size:10px;color:var(--txm);display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap}
+.fr label input[type="checkbox"]{accent-color:var(--ac)}
+.tag{font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px}
+.tag-v{background:var(--wnl);color:var(--wn)}
+.tag-b{background:#E0E8F0;color:#3A6090}
+.tag-t{background:#F0E0E8;color:#904060}
+.tag-s{background:#E0F0E8;color:#2D7A4F}
+.tag-a{background:#F0E8F4;color:#7040A0}
+.tag-e{background:#FDF5E0;color:#8B6914}
+.sub-block{margin:3px 0 5px 18px;padding:7px 9px;border-radius:var(--r)}
+.sub-bits{background:#F4F7FA;border-left:3px solid #3A6090}
+.sub-var{background:var(--bg);border-left:3px solid var(--wn)}
+.sub-struct{background:#F0FAF0;border-left:3px solid #2D7A4F}
+.sub-array{background:#F8F0FA;border-left:3px solid #7040A0}
+.sub-enum{background:#FDFAF0;border-left:3px solid #8B6914}
+.sblk-h{display:flex;align-items:center;gap:5px;margin-bottom:5px;font-size:11px;color:var(--tx2)}
+.sblk-h input{font-family:'IBM Plex Mono',monospace;font-size:11px;padding:2px 4px}
+.bfr{display:flex;align-items:center;gap:5px;padding:3px 0;font-size:11px}
+.bfr input{font-family:'IBM Plex Mono',monospace;font-size:11px;padding:2px 5px}
+.bfr input.bfn{width:100px}.bfr input.bfw{width:36px;text-align:center}
+.jo{font-family:'IBM Plex Mono',monospace;font-size:10px;line-height:1.7;background:var(--bg-code);border:1px solid var(--bd);border-radius:var(--r);padding:10px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto}
+.fig{display:grid;grid-template-columns:125px 1fr;gap:4px 7px;align-items:center;margin-bottom:10px}
+.fig .lb{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--tx2);text-align:right}
+.fig .ht{font-size:9px;color:var(--txm)}
+.rp{border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;margin-bottom:10px}
+.rp-h{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;background:var(--bg-in);border-bottom:1px solid var(--bd);font-size:10px;font-weight:600;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px}
+.rp-b{padding:9px}
+.hx{font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:2;background:var(--bg-hex);color:#C8C0B8;padding:9px 11px;border-radius:var(--r);word-break:break-all}
+.hb{color:#E8E0D8;font-weight:500}
+.stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.st{display:flex;flex-direction:column;padding:7px 10px;background:var(--bg-in);border-radius:var(--r);border:1px solid var(--bd);min-width:80px}
+.st-v{font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:600}
+.st-l{font-size:9px;color:var(--txm);text-transform:uppercase;letter-spacing:.4px}
+.st-hi{border-color:var(--ok);background:var(--okl)}.st-hi .st-v{color:var(--ok)}
+.do{font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.7;background:var(--bg-code);padding:9px 11px;border-radius:var(--r);border:1px solid var(--bd);white-space:pre-wrap}
+.empty{text-align:center;padding:28px 14px;color:var(--txm);font-size:12px}
+.sts{font-size:11px;padding:6px 9px;border-radius:var(--r);margin-bottom:8px}
+.sts-e{background:var(--acl);color:var(--acd);border:1px solid var(--ac)}
+.sts-o{background:var(--okl);color:var(--ok);border:1px solid var(--ok)}
+.ml{margin-left:auto}
+.opts-input{font-family:'IBM Plex Mono',monospace;font-size:11px;width:100%;padding:3px 6px}
+.sz-input{font-family:'IBM Plex Mono',monospace;font-size:11px;width:44px;text-align:center;padding:2px 4px}
+</style>
+</head>
+<body>
+<div class="hd"><h1><span>lite</span>pack</h1><div class="sub">Schema Builder & Binary Tester</div></div>
+<div class="main">
+<div>
+	<div class="card"><div class="card-h"><h2>Schema Builder</h2><button class="btn btn-p btn-sm" onclick="addField(fields)">+ Add Field</button></div><div class="card-b" id="FC"><div class="empty">Click <b>+ Add Field</b> to start</div></div></div>
+	<div class="card"><div class="card-h"><h2>Generated Schema</h2><button class="btn btn-sm" onclick="copyJSON()">Copy</button></div><div class="card-b"><div class="jo" id="JO">[]</div></div></div>
+</div>
+<div>
+	<div class="card"><div class="card-h"><h2>Encode / Decode Test</h2><button class="btn btn-p btn-sm" onclick="doEnc()">Encode</button></div>
+	<div class="card-b">
+		<div id="ES"></div><div id="EF"></div>
+		<div id="ER" style="display:none">
+			<div class="rp"><div class="rp-h"><span>Binary (hex)</span><span id="SL"></span></div><div class="rp-b"><div class="hx" id="HO"></div></div></div>
+			<div class="stats">
+				<div class="st" id="sD"><div class="st-v">—</div><div class="st-l">litepack</div></div>
+				<div class="st" id="sJ"><div class="st-v">—</div><div class="st-l">JSON</div></div>
+				<div class="st st-hi" id="sS"><div class="st-v">—</div><div class="st-l">saved</div></div>
+			</div>
+			<div class="rp"><div class="rp-h">Decode Verification</div><div class="rp-b"><div class="do" id="DO"></div></div></div>
+		</div>
+	</div></div>
+</div>
+</div>
+
+<script>
+var SIMPLE_TYPES=['uint8','int8','uint16','int16','uint32','int32','uint64','float32','float64','bool','varint','string','bytes'];
+var ALL_TYPES=SIMPLE_TYPES.concat(['bits','enum','set','fixed','struct','array','tail']);
+var fields=[],nFID=1;
+
+function mkField(name,type){return{id:nFID++,name:name||'field',type:type||'uint8',optional:false,hasVariants:false,variants:[],hasBits:false,bitFields:[],isTail:false,options:[],fixedLen:16,structFields:[],arrayItemType:'uint8',arrayFixedCount:null,arrayItemOptions:[],arrayItemFields:[],arrayItemBits:[],arrayItemFixedLen:16}}
+function addField(arr){arr.push(mkField('field_'+arr.length));render()}
+function rmField(arr,fid){for(var i=0;i<arr.length;i++){if(arr[i].id===fid){arr.splice(i,1);break}}render()}
+function findF(arr,fid){for(var i=0;i<arr.length;i++){if(arr[i].id===fid)return arr[i]}return null}
+
+function onTypeChg(arr,fid,val){
+	var f=findF(arr,fid);if(!f)return;f.type=val;
+	f.hasBits=val==='bits';f.isTail=val==='tail';f.hasVariants=false;
+	if(val==='bits'&&f.bitFields.length===0)f.bitFields.push({name:'flag',width:1});
+	if(val==='enum'&&f.options.length===0)f.options=['option1','option2'];
+	if(val==='set'&&f.options.length===0)f.options=['flag1','flag2'];
+	if(val==='struct'&&f.structFields.length===0)addField(f.structFields);
+	if(val==='array'&&f.arrayItemType==='uint8')f.arrayItemType='uint8';
+	if(val==='bits'||val==='tail'||val==='struct'||val==='array'||val==='enum'||val==='set'||val==='fixed')f.optional=false;
+	if(val!=='bits')f.hasBits=false;if(val!=='tail')f.isTail=false;
+	render();
+}
+function toggleVar(arr,fid){var f=findF(arr,fid);if(!f)return;f.hasVariants=!f.hasVariants;if(f.hasVariants&&f.variants.length===0)f.variants.push({key:'1',fields:[mkField('field','string')]});if(f.hasVariants)f.optional=false;render()}
+function addVar(arr,fid){var f=findF(arr,fid);if(!f)return;f.variants.push({key:String(f.variants.length+1),fields:[mkField('field','string')]});render()}
+function rmVar(arr,fid,vi){var f=findF(arr,fid);if(!f)return;f.variants.splice(vi,1);if(!f.variants.length)f.hasVariants=false;render()}
+function addVF(arr,fid,vi){var f=findF(arr,fid);if(!f||!f.variants[vi])return;f.variants[vi].fields.push(mkField('field_'+f.variants[vi].fields.length));render()}
+function rmVF(arr,fid,vi,vfi){var f=findF(arr,fid);if(!f||!f.variants[vi])return;f.variants[vi].fields.splice(vfi,1);render()}
+function addBF(arr,fid){var f=findF(arr,fid);if(!f)return;f.bitFields.push({name:'bit_'+f.bitFields.length,width:1});render()}
+function rmBF(arr,fid,bi){var f=findF(arr,fid);if(!f)return;f.bitFields.splice(bi,1);if(!f.bitFields.length)f.hasBits=false;render()}
+
+function syncField(f,prefix){
+	var fe=document.getElementById(prefix+f.id);if(!fe)return;
+	var fn=fe.querySelector(':scope>.fr .fn'),fo=fe.querySelector(':scope>.fr .fo');
+	if(fn)f.name=fn.value.replace(/[^a-zA-Z0-9_]/g,'')||'field';
+	var canOpt=f.type!=='bits'&&f.type!=='tail'&&f.type!=='struct'&&f.type!=='array'&&f.type!=='enum'&&f.type!=='set'&&f.type!=='fixed'&&!f.hasVariants;
+	if(fo&&canOpt)f.optional=fo.checked;
+	if(f.type==='enum'||f.type==='set'){var oi=fe.querySelector(':scope>.sub-enum .opts-input');if(oi)f.options=oi.value.split(',').map(function(s){return s.trim()}).filter(Boolean)}
+	if(f.type==='fixed'){var si=fe.querySelector(':scope>.sub-enum .sz-input');if(si)f.fixedLen=Math.max(1,parseInt(si.value)||1)}
+	if(f.hasBits)f.bitFields.forEach(function(bf,bi){var bn=fe.querySelector('.bn_'+bi),bw=fe.querySelector('.bw_'+bi);if(bn)bf.name=bn.value.replace(/[^a-zA-Z0-9_]/g,'')||'bit';if(bw)bf.width=Math.max(1,Math.min(32,parseInt(bw.value)||1))});
+	if(f.hasVariants)f.variants.forEach(function(v,vi){var vk=fe.querySelector('.vk_'+vi);if(vk)v.key=vk.value||String(vi);v.fields.forEach(function(vf){syncField(vf,prefix)})});
+	if(f.type==='struct')f.structFields.forEach(function(sf){syncField(sf,prefix)});
+	if(f.type==='array'){
+		var ait=fe.querySelector(':scope>.sub-array .ait');if(ait)f.arrayItemType=ait.value;
+		var afc=fe.querySelector(':scope>.sub-array .afc');if(afc)f.arrayFixedCount=afc.value===''?null:Math.max(1,parseInt(afc.value)||1);
+		var aio=fe.querySelector(':scope>.sub-array .aio');if(aio)f.arrayItemOptions=aio.value.split(',').map(function(s){return s.trim()}).filter(Boolean);
+		var aifl=fe.querySelector(':scope>.sub-array .aifl');if(aifl)f.arrayItemFixedLen=Math.max(1,parseInt(aifl.value)||1);
+		f.arrayItemFields.forEach(function(sf){syncField(sf,prefix)});
+		f.arrayItemBits.forEach(function(bf,bi){var bn=fe.querySelector('.abn_'+bi),bw=fe.querySelector('.abw_'+bi);if(bn)bf.name=bn.value.replace(/[^a-zA-Z0-9_]/g,'')||'bit';if(bw)bf.width=Math.max(1,Math.min(32,parseInt(bw.value)||1))});
+	}
+}
+function sync(){fields.forEach(function(f){syncField(f,'f_')})}
+
+function render(){sync();var c=document.getElementById('FC');
+	if(!fields.length){c.innerHTML='<div class="empty">Click <b>+ Add Field</b> to start</div>';updJSON();updTestForm();return}
+	c.innerHTML=fields.map(function(f){return rField(f,fields,'f_')}).join('');updJSON();updTestForm();}
+
+function rField(f,parentArr,prefix){
+	var pid=JSON.stringify(parentArr===fields?'fields':'sub');
+	var h='<div id="'+prefix+f.id+'"><div class="fr">';
+	h+='<input class="fn" value="'+esc(f.name)+'" onchange="render()" spellcheck="false">';
+	h+=typeSel(f.type,parentArr,f.id);
+	var canOpt=f.type!=='bits'&&f.type!=='tail'&&f.type!=='struct'&&f.type!=='array'&&f.type!=='enum'&&f.type!=='set'&&f.type!=='fixed'&&!f.hasVariants;
+	if(canOpt)h+='<label><input type="checkbox" class="fo"'+(f.optional?' checked':'')+' onchange="render()"> opt</label>';
+	var canVar=canOpt&&f.type!=='bool';
+	if(canVar)h+='<label><input type="checkbox"'+(f.hasVariants?' checked':'')+' onchange="toggleVar(getArr(this),'+f.id+')"> variants</label>';
+	if(f.hasVariants)h+='<span class="tag tag-v">union</span>';
+	if(f.type==='bits'){var tb=0;f.bitFields.forEach(function(bf){tb+=bf.width});h+='<span class="tag tag-b">'+tb+'b = '+Math.ceil(tb/8)+'B</span>';}
+	if(f.type==='tail')h+='<span class="tag tag-t">tail</span>';
+	if(f.type==='struct')h+='<span class="tag tag-s">struct</span>';
+	if(f.type==='array')h+='<span class="tag tag-a">array</span>';
+	if(f.type==='enum')h+='<span class="tag tag-e">enum</span>';
+	if(f.type==='set')h+='<span class="tag tag-e">set</span>';
+	if(f.type==='fixed')h+='<span class="tag tag-b">'+f.fixedLen+'B</span>';
+	h+='<button class="btn-x" onclick="rmFieldUI(this,'+f.id+')">×</button></div>';
+
+	// Bits
+	if(f.type==='bits'){h+='<div class="sub-block sub-bits">';f.bitFields.forEach(function(bf,bi){h+='<div class="bfr"><input class="bfn bn_'+bi+'" value="'+esc(bf.name)+'" onchange="render()" spellcheck="false"><input class="bfw bw_'+bi+'" value="'+bf.width+'" onchange="render()" type="number" min="1" max="32"> bits<button class="btn-x" onclick="rmBF(getArr(this),'+f.id+','+bi+')">×</button></div>'});h+='<button class="btn btn-sm" onclick="addBF(getArr(this),'+f.id+')" style="margin-top:4px">+ Bit</button></div>';}
+
+	// Enum / Set
+	if(f.type==='enum'||f.type==='set'){h+='<div class="sub-block sub-enum"><div class="sblk-h">Options (comma separated)</div><input class="opts-input" value="'+esc(f.options.join(', '))+'" onchange="render()" spellcheck="false"></div>';}
+
+	// Fixed
+	if(f.type==='fixed'){h+='<div class="sub-block sub-enum"><div class="sblk-h">Byte count: <input class="sz-input" value="'+f.fixedLen+'" onchange="render()" type="number" min="1"></div></div>';}
+
+	// Struct
+	if(f.type==='struct'){h+='<div class="sub-block sub-struct"><div class="sblk-h">Fields <button class="btn btn-sm" onclick="addField(findF(getArr(this),'+f.id+').structFields);render()">+ Field</button></div>';h+=f.structFields.map(function(sf){return rField(sf,f.structFields,prefix)}).join('');h+='</div>';}
+
+	// Array
+	if(f.type==='array'){h+='<div class="sub-block sub-array"><div class="sblk-h">Item type: '+arrTypeSel(f)+' Count: <input class="afc" value="'+(f.arrayFixedCount===null?'':f.arrayFixedCount)+'" onchange="render()" placeholder="variable" style="width:60px;font-size:11px"></div>';
+	if(f.arrayItemType==='enum'||f.arrayItemType==='set'){h+='<div style="margin-top:4px"><span style="font-size:10px;color:var(--tx2)">Options:</span> <input class="aio opts-input" value="'+esc(f.arrayItemOptions.join(', '))+'" onchange="render()" spellcheck="false"></div>';}
+	if(f.arrayItemType==='fixed'){h+='<div style="margin-top:4px"><span style="font-size:10px;color:var(--tx2)">Bytes:</span> <input class="aifl sz-input" value="'+f.arrayItemFixedLen+'" onchange="render()" type="number" min="1"></div>';}
+	if(f.arrayItemType==='struct'){h+='<div style="margin-top:5px"><div class="sblk-h">Item fields <button class="btn btn-sm" onclick="addField(findF(getArr(this),'+f.id+').arrayItemFields);render()">+ Field</button></div>';h+=f.arrayItemFields.map(function(sf){return rField(sf,f.arrayItemFields,prefix)}).join('');h+='</div>';}
+	if(f.arrayItemType==='bits'){h+='<div style="margin-top:5px">';f.arrayItemBits.forEach(function(bf,bi){h+='<div class="bfr"><input class="bfn abn_'+bi+'" value="'+esc(bf.name)+'" onchange="render()"><input class="bfw abw_'+bi+'" value="'+bf.width+'" onchange="render()" type="number" min="1" max="32"> bits<button class="btn-x" onclick="var f=findF(getArr(this),'+f.id+');f.arrayItemBits.splice('+bi+',1);render()">×</button></div>'});h+='<button class="btn btn-sm" onclick="findF(getArr(this),'+f.id+').arrayItemBits.push({name:\'bit\',width:1});render()">+ Bit</button></div>';}
+	h+='</div>';}
+
+	// Variants
+	if(f.hasVariants){f.variants.forEach(function(v,vi){h+='<div class="sub-block sub-var"><div class="sblk-h">when <b>'+esc(f.name)+'</b> = <input class="vk vk_'+vi+'" value="'+esc(v.key)+'" onchange="render()" style="width:44px;text-align:center"><span class="ml"></span><button class="btn btn-sm" onclick="addVF(getArr(this),'+f.id+','+vi+')">+ Field</button><button class="btn-x" onclick="rmVar(getArr(this),'+f.id+','+vi+')">×</button></div>';v.fields.forEach(function(vf,vfi){h+='<div class="fr" id="'+prefix+vf.id+'"><input class="fn" value="'+esc(vf.name)+'" onchange="render()" spellcheck="false">'+typeSel(vf.type,v.fields,vf.id,true)+'<label><input type="checkbox" class="fo"'+(vf.optional?' checked':'')+' onchange="render()"> opt</label><button class="btn-x" onclick="rmVF(getArr(this),'+f.id+','+vi+','+vfi+')">×</button></div>'});h+='</div>'});h+='<div style="padding:0 0 3px 18px"><button class="btn btn-sm" onclick="addVar(getArr(this),'+f.id+')">+ Case</button></div>';}
+	h+='</div>';return h;
+}
+
+function typeSel(sel,arr,fid,simple){
+	var list=simple?SIMPLE_TYPES:ALL_TYPES;
+	var h='<select class="ft" onchange="onTypeChg(getArr(this),'+fid+',this.value)">';
+	list.forEach(function(t){h+='<option'+(t===sel?' selected':'')+'>'+t+'</option>'});return h+'</select>';
+}
+function arrTypeSel(f){
+	var list=SIMPLE_TYPES.concat(['enum','set','bits','fixed','struct']);
+	var h='<select class="ait" onchange="arrTypeChg(this,'+f.id+')">';
+	list.forEach(function(t){h+='<option'+(t===f.arrayItemType?' selected':'')+'>'+t+'</option>'});return h+'</select>';
+}
+function arrTypeChg(el,fid){
+	var f=findF(getArr(el),fid);if(!f)return;f.arrayItemType=el.value;
+	if(el.value==='struct'&&!f.arrayItemFields.length)addField(f.arrayItemFields);
+	if(el.value==='bits'&&!f.arrayItemBits.length)f.arrayItemBits.push({name:'flag',width:1});
+	if((el.value==='enum'||el.value==='set')&&!f.arrayItemOptions.length)f.arrayItemOptions=['opt1','opt2'];
+	render();
+}
+function getArr(el){while(el&&!el.classList.contains('card-b')&&!el.classList.contains('sub-struct')&&!el.classList.contains('sub-array'))el=el.parentElement;return fields}
+function rmFieldUI(el,fid){rmField(fields,fid);fields.forEach(function(f){if(f.structFields)rmField(f.structFields,fid);if(f.arrayItemFields)rmField(f.arrayItemFields,fid)});render()}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}
+
+// JSON
+function buildFieldJSON(f){
+	if(f.type==='bits')return[f.name,'bits',f.bitFields.map(function(b){return[b.name,b.width]})];
+	if(f.type==='tail')return[f.name,'tail'];
+	if(f.type==='enum')return[f.name,'enum'+(f.optional?'?':''),f.options];
+	if(f.type==='set')return[f.name,'set'+(f.optional?'?':''),f.options];
+	if(f.type==='fixed')return[f.name,'fixed',f.fixedLen];
+	if(f.type==='struct')return[f.name,'struct',f.structFields.map(buildFieldJSON)];
+	if(f.type==='array'){
+		var r=[f.name,'array'+(f.optional?'?':''),f.arrayItemType];
+		if(f.arrayItemType==='struct')r.push(f.arrayItemFields.map(buildFieldJSON));
+		else if(f.arrayItemType==='enum'||f.arrayItemType==='set')r.push(f.arrayItemOptions);
+		else if(f.arrayItemType==='bits')r.push(f.arrayItemBits.map(function(b){return[b.name,b.width]}));
+		else if(f.arrayItemType==='fixed')r.push(f.arrayItemFixedLen);
+		if(f.arrayFixedCount!==null)r.push(f.arrayFixedCount);
+		return r;
+	}
+	var ts=f.type+(f.optional?'?':''),entry=[f.name,ts];
+	if(f.hasVariants){entry[1]=f.type;var vars={};f.variants.forEach(function(v){vars[v.key]=v.fields.map(buildFieldJSON)});entry.push(vars);}
+	return entry;
+}
+function buildJSON(){sync();return fields.map(buildFieldJSON)}
+function updJSON(){document.getElementById('JO').textContent=JSON.stringify(buildJSON(),null,2)}
+function copyJSON(){navigator.clipboard.writeText(document.getElementById('JO').textContent)}
+
+// Tester
+function flattenFields(flds,prefix,into){
+	flds.forEach(function(f){
+		var n=prefix?prefix+'.'+f.name:f.name;
+		if(f.type==='struct'){flattenFields(f.structFields,n,into);return}
+		into.push({name:n,type:f.type,optional:f.optional,field:f});
+	});
+	return into;
+}
+var NUMERIC_ITEMS={uint8:1,int8:1,uint16:1,int16:1,uint32:1,int32:1,uint64:1,float32:1,float64:1,varint:1};
+function isSimpleArray(f){return f.type==='array'&&(f.arrayItemType==='string'||f.arrayItemType==='enum'||f.arrayItemType==='set'||NUMERIC_ITEMS[f.arrayItemType])}
+function updTestForm(){
+	var c=document.getElementById('EF');document.getElementById('ER').style.display='none';
+	if(!fields.length){c.innerHTML='';return}
+	var tf=flattenFields(fields,'',[]); var h='<div class="fig">';
+	tf.forEach(function(f){
+		var ff=f.field;
+		h+='<div class="lb">'+f.name+(f.optional?' <span class="ht">?</span>':'')+'</div>';
+		if(f.type==='array'&&isSimpleArray(ff)){
+			var ph=ff.arrayItemType==='string'?'hello, world':ff.arrayItemType==='enum'?ff.arrayItemOptions.join(', '):ff.arrayItemType==='set'?'[a,b], [c,d]':'1, 2, 3';
+			h+='<input id="val_'+f.name+'" placeholder="'+ph+'" style="width:100%">';
+		}else if(f.type==='array'||f.type==='bits'){
+			h+='<textarea id="val_'+f.name+'" rows="2" placeholder="JSON" style="width:100%;font-size:11px"></textarea>';
+		}else if(f.type==='enum'){
+			h+='<input id="val_'+f.name+'" placeholder="'+ff.options.join(' | ')+'" style="width:100%">';
+		}else if(f.type==='set'){
+			h+='<input id="val_'+f.name+'" placeholder="'+ff.options.join(', ')+'" style="width:100%">';
+		}else{
+			h+='<input id="val_'+f.name+'" placeholder="'+f.type+(f.optional?' (opt)':'')+'" style="width:100%">';
+		}
+	});
+	h+='</div>';c.innerHTML=h;
+}
+
+function collectData(flds,prefix){
+	var data={};
+	flds.forEach(function(f){
+		var n=prefix?prefix+'.'+f.name:f.name;
+		if(f.type==='struct'){data[f.name]=collectData(f.structFields,n);return}
+		var el=document.getElementById('val_'+n);if(!el)return;
+		var raw=el.value.trim();
+		if(raw===''&&f.optional)return;
+		if(f.type==='bits'){try{data[f.name]=JSON.parse(raw||'{}')}catch(e){data[f.name]={}}return}
+		if(f.type==='array'){
+			if(isSimpleArray(f)){
+				if(raw===''){data[f.name]=[];return}
+				var parts=raw.split(',').map(function(s){return s.trim()}).filter(Boolean);
+				if(f.arrayItemType==='string'||f.arrayItemType==='enum'){data[f.name]=parts;}
+				else{data[f.name]=parts.map(function(s){return f.arrayItemType.indexOf('float')>=0?parseFloat(s):parseInt(s)||0});}
+			}else{
+				try{data[f.name]=JSON.parse(raw||'[]')}catch(e){data[f.name]=[]}
+			}
+			return;
+		}
+		if(f.type==='enum'){data[f.name]=raw;return}
+		if(f.type==='set'){data[f.name]=raw?raw.split(',').map(function(s){return s.trim()}).filter(Boolean):[];return}
+		data[f.name]=parseVal(raw,f.type);
+	});
+	return data;
+}
+
+function doEnc(){
+	if(!fields.length){showSt('Add fields first',true);return}
+	var schema=buildJSON();var data=collectData(fields,'');
+	try{
+		var buf=litepack.encode(schema,data);var jb=new TextEncoder().encode(JSON.stringify(data));
+		var hh='';for(var i=0;i<buf.length;i++){hh+='<span class="hb">'+('0'+buf[i].toString(16)).slice(-2).toUpperCase()+'</span> ';if((i+1)%16===0)hh+='\n'}
+		document.getElementById('HO').innerHTML=hh;
+		document.getElementById('SL').textContent=buf.length+' bytes';
+		document.getElementById('sD').querySelector('.st-v').textContent=buf.length;
+		document.getElementById('sJ').querySelector('.st-v').textContent=jb.length;
+		var pct=jb.length>0?Math.round((1-buf.length/jb.length)*100):0;
+		document.getElementById('sS').querySelector('.st-v').textContent=pct+'%';
+		var msg=litepack.decode(schema,buf);
+		document.getElementById('DO').textContent=JSON.stringify(msg,null,2);
+		document.getElementById('ER').style.display='';
+		showSt('Encoded '+buf.length+' bytes — decode OK',false);
+	}catch(e){showSt('Error: '+e.message,true)}
+}
+
+function parseVal(raw,type){
+	if(raw==='')return type==='string'?'':0;
+	if(type==='bool')return raw==='true'||raw==='1';
+	if(type==='string')return raw;
+	if(type==='bytes'||type==='fixed'||type==='tail'){
+		if(raw.indexOf(',')>=0)return new Uint8Array(raw.split(',').map(function(s){return parseInt(s.trim())}));
+		var hex=raw.replace(/\s/g,'').replace(/0x/g,'');var a=[];for(var i=0;i<hex.length;i+=2)a.push(parseInt(hex.substr(i,2),16));return new Uint8Array(a);
+	}
+	if(type.indexOf('float')>=0)return parseFloat(raw);
+	return parseInt(raw)||0;
+}
+function showSt(m,e){var el=document.getElementById('ES');el.innerHTML='<div class="sts '+(e?'sts-e':'sts-o')+'">'+esc(m)+'</div>';setTimeout(function(){el.innerHTML=''},4000)}
+
+// Init
+(function(){
+	if(typeof litepack==='undefined'){document.body.innerHTML='<div style="padding:40px;color:#C05430;font-size:16px;font-family:monospace">Error: <b>litepack.js</b> not found.</div>';return}
+	fields=[
+		mkField('device_id','uint16'),
+		{id:nFID++,name:'flags',type:'bits',optional:false,hasVariants:false,variants:[],hasBits:true,bitFields:[{name:'active',width:1},{name:'mode',width:3},{name:'quality',width:4}],isTail:false,options:[],fixedLen:16,structFields:[],arrayItemType:'uint8',arrayFixedCount:null,arrayItemOptions:[],arrayItemFields:[],arrayItemBits:[],arrayItemFixedLen:16},
+		{id:nFID++,name:'status',type:'enum',optional:false,hasVariants:false,variants:[],hasBits:false,bitFields:[],isTail:false,options:['online','offline','error'],fixedLen:16,structFields:[],arrayItemType:'uint8',arrayFixedCount:null,arrayItemOptions:[],arrayItemFields:[],arrayItemBits:[],arrayItemFixedLen:16},
+		{id:nFID++,name:'temperature',type:'float32',optional:true,hasVariants:false,variants:[],hasBits:false,bitFields:[],isTail:false,options:[],fixedLen:16,structFields:[],arrayItemType:'uint8',arrayFixedCount:null,arrayItemOptions:[],arrayItemFields:[],arrayItemBits:[],arrayItemFixedLen:16},
+		{id:nFID++,name:'tags',type:'array',optional:false,hasVariants:false,variants:[],hasBits:false,bitFields:[],isTail:false,options:[],fixedLen:16,structFields:[],arrayItemType:'string',arrayFixedCount:null,arrayItemOptions:[],arrayItemFields:[],arrayItemBits:[],arrayItemFixedLen:16},
+	];
+	render();
+})();
+</script>
+</body>
+</html>
