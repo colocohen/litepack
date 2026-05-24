@@ -18,30 +18,33 @@
 // ── Varint (unsigned LEB128) ────────────────────────────────
 
 function writeVarint(val, buf, pos) {
-    val = val >>> 0 || 0;
+    if (typeof val !== 'number' || val < 0) val = 0;
+    val = Math.floor(val);
     var start = pos;
     while (val > 0x7F) {
-        buf[pos++] = (val & 0x7F) | 0x80;
-        val = val >>> 7;
+        buf[pos++] = (val % 128) | 0x80;
+        val = Math.floor(val / 128);
     }
-    buf[pos++] = val & 0x7F;
+    buf[pos++] = val;
     return pos - start;
 }
 
 function readVarint(buf, pos) {
-    var val = 0, shift = 0, b;
+    var val = 0, shift = 0, b, mul = 1;
     do {
         b = buf[pos++];
-        val |= (b & 0x7F) << shift;
+        val += (b & 0x7F) * mul;
+        mul *= 128;
         shift += 7;
     } while (b & 0x80);
-    return { value: val >>> 0, bytesRead: shift / 7 };
+    return { value: val, bytesRead: shift / 7 };
 }
 
 function varintSize(val) {
-    val = val >>> 0 || 0;
+    if (typeof val !== 'number' || val < 0) val = 0;
+    val = Math.floor(val);
     var n = 1;
-    while (val > 0x7F) { n++; val = val >>> 7; }
+    while (val > 0x7F) { n++; val = Math.floor(val / 128); }
     return n;
 }
 
