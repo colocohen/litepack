@@ -49,16 +49,39 @@ typical structured messages.
 * Schemaless data — if you truly can't know the shape ahead of time,
   use the built-in `json` field type as an escape hatch, or CBOR/MsgPack.
 
+## 📖 Contents
+
+* [Installation](#-installation) · [Quick Start](#-quick-start) · [Complete example](#-complete-example-clientserver-over-websocket)
+* [What the bytes look like](#-what-the-bytes-look-like) · [Types](#-types) · [API](#-api)
+* [Streaming & chaining](#-streaming--chaining-multiple-messages-one-buffer) · [Real-world examples](#-real-world-examples)
+* [Schema evolution](#-schema-evolution) · [Robustness](#-robustness-model) · [Performance](#-performance)
+* [Common pitfalls](#-common-pitfalls) · [How does it compare?](#-how-does-it-compare)
+
 ## 📦 Installation
 
 ```
 npm i litepack
 ```
 
-Or just drop `litepack.js` into your project — it's a single UMD file that
-works with `require`, `import`, or a `<script>` tag, in Node.js, browsers,
-Service Workers, Bun and Deno. TypeScript declarations (`litepack.d.ts`)
-give you autocomplete even in plain-JS projects.
+Or just drop `litepack.js` into your project — it's a single UMD file.
+All of these work:
+
+```js
+// Node.js / bundlers
+var litepack = require('litepack');
+import litepack from 'litepack';
+
+// Browser — plain script tag → global
+<script src="litepack.js"></script>
+<script> litepack.encode(schema, data); </script>
+
+// Service Worker
+importScripts('/js/litepack.js');     // → self.litepack
+```
+
+Runs in Node.js, browsers, Service Workers, Bun and Deno. TypeScript
+declarations (`litepack.d.ts`) give you autocomplete even in plain-JS
+projects — just keep the file next to `litepack.js`.
 
 ## 🚀 Quick Start
 
@@ -88,6 +111,50 @@ var msg = litepack.tryDecode(userProto, untrustedBytes);
 if (!msg) return;   // malformed / truncated / hostile input — dropped
 ```
 
+## 🔄 Complete example: client/server over WebSocket
+
+Both sides share one schema module — that's the entire "protocol spec":
+
+```js
+// ── shared/protocol.js — the single source of truth ──────────────
+var OP = { CHAT: 1, MOVE: 2 };
+
+var chatProto = [
+    ['op',   'const', 'uint8', OP.CHAT],   // written & verified automatically
+    ['from', 'varint'],
+    ['text', 'string']
+];
+
+var moveProto = [
+    ['op', 'const', 'uint8', OP.MOVE],
+    ['id', 'varint'],
+    ['x',  'svarint'],
+    ['y',  'svarint']
+];
+
+// ── sender (either side) ─────────────────────────────────────────
+socket.send(litepack.encode(chatProto, { from: myId, text: 'hi!' }));
+socket.send(litepack.encode(moveProto, { id: myId, x: -3, y: 12 }));
+
+// ── receiver (either side) ───────────────────────────────────────
+socket.onmessage = function(event) {
+    var buf = new Uint8Array(event.data);
+    var op = buf[0];                          // opcode is always byte 0
+
+    var msg = op === OP.CHAT ? litepack.tryDecode(chatProto, buf)
+            : op === OP.MOVE ? litepack.tryDecode(moveProto, buf)
+            : null;
+    if (!msg) return;                          // unknown op / malformed / hostile
+
+    if (op === OP.CHAT) showChat(msg.from, msg.text);
+    if (op === OP.MOVE) moveEntity(msg.id, msg.x, msg.y);
+};
+```
+
+That's the whole pattern: shared schemas, `encode` out, `tryDecode` in,
+`const` validating the opcode for free. Everything else in this README is
+refinement of this loop.
+
 ## 🔍 What the bytes look like
 
 Understanding the wire format takes one example. Take this schema and data:
@@ -116,6 +183,33 @@ Wire bytes: `00 AC 02 00 03 44 61 6E`
 delimiters, no type tags — the schema on both sides is the contract.
 
 ## 📋 Types
+
+**Cheatsheet** — every type at a glance:
+
+| Type | Wire size | Use for |
+|---|---|---|
+| `uint8/16/32`, `int8/16/32` | 1/2/4 B fixed | values with a known range |
+| `uint64`, `int64` | 8 B | file sizes, big ids (BigInt beyond 2^53) |
+| `varint` | 1-8 B | counts, ids, timestamps — usually small, sometimes big |
+| `svarint` | 1-8 B | signed deltas, coordinates |
+| `timestamp` | = varint | readability alias |
+| `float32/64` | 4/8 B | real numbers |
+| `bool` | 1 B | single flag (many flags → `bits`) |
+| `string` | len + UTF-8 | text |
+| `bytes` | len + raw | binary blobs |
+| `fixed`, `uuid` | exactly N / 16 B | hashes, keys, ids — no prefix |
+| `tail` | rest of buffer | final blob, top-level last field only |
+| `enum` | 1+ B index | one choice from a list |
+| `set` | 1+ B bitmask | multiple choices from a list (≤52) |
+| `bits` | packed | several small ints in minimal bytes |
+| `const` | = base type | protocol constants — auto-written, verified |
+| `struct` | inline | nested object |
+| `array` | count + items | lists, incl. arrays of structs |
+| `map` | count + pairs | dynamic keys, typed values |
+| `json` | len + JSON | free-form escape hatch |
+| *(custom)* | len + codec | anything via `litepack.codec()` |
+
+Any type + `?` = optional (zero bytes when absent).
 
 ### Integers
 
@@ -773,6 +867,31 @@ litepack.test.js        — core test suite
 litepack.chain.test.js  — streaming/composition test suite
 litepack-tool.html      — interactive schema builder & tester
 ```
+
+## ⚠️ Common pitfalls
+
+The five mistakes everyone makes once — read this and make zero:
+
+**1. Field order IS the protocol.** There are no field names or tags on the
+wire. If the sender's schema says `[id, name]` and the receiver's says
+`[name, id]`, you get garbage — both sides must use the *identical* schema.
+Share it as a module or JSON file; never retype it.
+
+**2. Decoded `bytes`/`fixed`/`uuid`/`tail` are views.** They point into
+the input buffer. If you recycle that buffer (common with sockets), your
+decoded values silently change. Recycling? → `decode(proto, buf, {copy:true})`.
+
+**3. Reparsing schemas kills the cache.** Compilation is cached by array
+*identity*. `JSON.parse(schemaText)` inside a hot loop creates a new array
+every call → recompiles every call. Parse once at module level.
+
+**4. `varint` is unsigned.** `-1` throws (on purpose). Deltas and
+coordinates that go negative → `svarint`.
+
+**5. Untrusted input goes through `tryDecode`.** Plain `decode` throws on
+malformed bytes — correct for your own data, but an unhandled exception in
+a socket handler if a hostile peer sends garbage. `tryDecode` → `null` →
+`return`.
 
 ## 🥊 How does it compare?
 
