@@ -26,6 +26,16 @@
 
 var MAX_VARINT_BYTES = 8;
 
+// Truncation errors carry .truncated = true — meaning "more bytes MIGHT
+// complete this message" (relevant when parsing a raw TCP stream without
+// framing). Malformed errors (structurally invalid regardless of length)
+// do not. See README "Streaming over raw sockets".
+function truncErr(msg) {
+    var e = new Error(msg);
+    e.truncated = true;
+    return e;
+}
+
 function writeVarint(val, buf, pos) {
     if (typeof val !== 'number') val = 0;
     else if (val < 0) throw new Error("litepack: varint cannot encode negative value " + val + " (use 'svarint' for signed)");
@@ -45,7 +55,7 @@ function readVarint(buf, pos) {
     do {
         if (n >= MAX_VARINT_BYTES) throw new Error('litepack: malformed varint (too long) at byte ' + (pos - n));
         b = buf[pos++];
-        if (b === undefined) throw new Error('litepack: truncated varint at byte ' + (pos - 1));
+        if (b === undefined) throw truncErr('litepack: truncated varint at byte ' + (pos - 1));
         val += (b & 0x7F) * mul;
         mul *= 128;
         n++;
@@ -333,6 +343,20 @@ TYPES.varint = {
     read:  function(buf, pos) { return readVarint(buf, pos); }
 };
 
+// UUID / 16-byte ids — exactly 16 bytes, no length prefix
+TYPES.uuid = {
+    size: 16,
+    write: function(v, buf, pos) {
+        if (v && v.length) buf.set(v.subarray ? v.subarray(0, 16) : v, pos);
+        else for (var i = 0; i < 16; i++) buf[pos + i] = 0;
+        return 16;
+    },
+    read: function(buf, pos) {
+        if (pos + 16 > buf.length) throw truncErr('litepack: truncated uuid at byte ' + pos);
+        return { value: buf.subarray(pos, pos + 16), bytesRead: 16 };
+    }
+};
+
 // Signed varint (zigzag) — negative values welcome, small magnitudes stay small
 TYPES.svarint = {
     size: null,
@@ -366,7 +390,7 @@ TYPES.string = {
     read: function(buf, pos) {
         var l = readVarint(buf, pos);
         if (pos + l.bytesRead + l.value > buf.length) {
-            throw new Error('litepack: truncated string at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - pos - l.bytesRead) + ' remain)');
+            throw truncErr('litepack: truncated string at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - pos - l.bytesRead) + ' remain)');
         }
         return { value: utf8Decode(buf, pos + l.bytesRead, l.value), bytesRead: l.bytesRead + l.value };
     }
@@ -385,7 +409,7 @@ TYPES.bytes = {
         var l = readVarint(buf, pos);
         var s = pos + l.bytesRead;
         if (s + l.value > buf.length) {
-            throw new Error('litepack: truncated bytes at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - s) + ' remain)');
+            throw truncErr('litepack: truncated bytes at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - s) + ' remain)');
         }
         return { value: buf.subarray(s, s + l.value), bytesRead: l.bytesRead + l.value };
     }
@@ -424,9 +448,32 @@ var MAX_OPTIONAL_FIELDS = 52;
 
 // Compound types that REQUIRE a third schema element — catch at compile with
 // a real message instead of "f.write is not a function" at encode time.
-var NEEDS_DEF = { bits: 1, 'enum': 1, set: 1, fixed: 1, struct: 1, array: 1 };
+var NEEDS_DEF = { bits: 1, 'enum': 1, set: 1, fixed: 1, struct: 1, array: 1, map: 1, 'const': 1 };
 
-function compileFields(fieldDefs) {
+var KNOWN_OPTIONS = { 'default': 1 };
+function isOptionsObject(o) {
+    var any = false;
+    for (var k in o) {
+        if (!o.hasOwnProperty(k)) continue;
+        if (!KNOWN_OPTIONS[k]) return false;
+        any = true;
+    }
+    return any;
+}
+
+// Defaults may be objects/arrays — each decode gets its OWN copy so
+// mutating one decoded record can never leak into the next.
+function cloneDefault(v) {
+    if (Array.isArray(v)) return v.slice();
+    if (v && typeof v === 'object') {
+        var o = {};
+        for (var k in v) if (v.hasOwnProperty(k)) o[k] = v[k];
+        return o;
+    }
+    return v;
+}
+
+function compileFields(fieldDefs, nested) {
     var fields = [];
     var optionalCount = 0;
 
@@ -435,24 +482,66 @@ function compileFields(fieldDefs) {
         var fname = fd[0];
         var ftype = fd[1];
         var optional = false;
+        var f0default, f0hasDefault = false;
 
         if (typeof ftype !== 'string') {
             throw new Error("litepack: field '" + fname + "' — type must be a string, got " + typeof ftype);
         }
+
+        // Options object at the END of the def: ['retries','varint?',{default:3}]
+        // Recognized only when it's a plain object whose keys are all known
+        // option names — so variant maps (whose values are schemas) never match.
+        if (fd.length > 2) {
+            var lastEl = fd[fd.length - 1];
+            if (lastEl && typeof lastEl === 'object' && !Array.isArray(lastEl) && isOptionsObject(lastEl)) {
+                fd = fd.slice(0, -1);
+                if (lastEl.hasOwnProperty('default')) {
+                    f0default = lastEl['default'];
+                    f0hasDefault = true;
+                }
+            }
+        }
+
+        // Readability aliases — normalized here so the estimator's
+        // switch-by-type-name sees the canonical name.
+        if (ftype === 'timestamp') ftype = 'varint';
+        else if (ftype === 'timestamp?') ftype = 'varint?';
+        else if (ftype === 'uint8s') ftype = 'bytes';
+        else if (ftype === 'uint8s?') ftype = 'bytes?';
 
         if (ftype.charAt(ftype.length - 1) === '?') {
             optional = true;
             ftype = ftype.substring(0, ftype.length - 1);
         }
 
+        if (ftype === 'tail') {
+            // 'tail' means "the rest of the buffer" — only meaningful as the
+            // LAST field of a TOP-LEVEL schema. Inside a nested struct or an
+            // array item there is no defined end, so it silently corrupts.
+            if (nested) {
+                throw new Error("litepack: field '" + fname + "' — 'tail' is not allowed inside a nested struct or array item (no defined end); use 'bytes' (length-prefixed) instead");
+            }
+            if (i !== fieldDefs.length - 1) {
+                throw new Error("litepack: field '" + fname + "' — 'tail' must be the last field in the schema");
+            }
+        }
+
         if (NEEDS_DEF[ftype] && fd[2] === undefined) {
             throw new Error("litepack: field '" + fname + "' — type '" + ftype + "' requires a definition (third element), e.g. ['" + fname + "', '" + ftype + "', ...]");
+        }
+        if (ftype === 'const' && fd.length < 4) {
+            throw new Error("litepack: field '" + fname + "' — const requires a base type AND a value: ['" + fname + "', 'const', 'uint8', 64]");
+        }
+        if (ftype === 'map' && typeof fd[3] !== 'string') {
+            throw new Error("litepack: field '" + fname + "' — map requires key and value types: ['" + fname + "', 'map', 'string', 'varint']");
         }
 
         var f = {
             name: fname,
             type: ftype,
             optional: optional,
+            hasDefault: f0hasDefault,
+            defaultValue: f0default,
             optionalIndex: optional ? optionalCount : -1,
             optionalBit: optional ? Math.pow(2, optionalCount) : 0,
             isTail: ftype === 'tail',
@@ -489,6 +578,35 @@ function compileFields(fieldDefs) {
             f.setOpts = fd[2];
             f.write = createSetWriter(fd[2], fname);
             f.read = createSetReader(fd[2]);
+        } else if (ftype === 'map' && fd[2]) {
+            // Map: ['meta','map',keyType,valType] or ['meta','map','string','struct',schema]
+            f.mapDef = compileMap(fd, fname);
+            f.write = createMapWriter(f.mapDef, fname);
+            f.read = createMapReader(f.mapDef);
+        } else if (ftype === 'const' && fd.length >= 4) {
+            // Constant field: ['type','const','uint8',64]
+            // encode writes the constant automatically (data value ignored);
+            // decode verifies it and REJECTS the message on mismatch.
+            var cBase = resolveType(fd[2], fname);
+            var cVal = fd[3];
+            if (!cBase.write || !cBase.read) {
+                throw new Error("litepack: field '" + fname + "' — const base type '" + fd[2] + "' is not a simple type");
+            }
+            f.constValue = cVal;
+            f.constBaseType = fd[2];
+            f.fixedSize = cBase.size;
+            f.write = (function(base, cv) {
+                return function(val, buf, pos) { return base.write(cv, buf, pos); };
+            })(cBase, cVal);
+            f.read = (function(base, cv, nm) {
+                return function(buf, pos) {
+                    var r = base.read(buf, pos);
+                    if (r.value !== cv) {
+                        throw new Error("litepack: field '" + nm + "' — const mismatch (expected " + JSON.stringify(cv) + ", got " + JSON.stringify(r.value) + ')');
+                    }
+                    return r;
+                };
+            })(cBase, cVal, fname);
         } else if (ftype === 'fixed' && fd[2]) {
             // Fixed-length bytes — no length prefix
             f.fixedLen = fd[2];
@@ -497,7 +615,7 @@ function compileFields(fieldDefs) {
             f.read = createFixedReader(fd[2]);
         } else if (ftype === 'struct' && fd[2]) {
             // Nested struct
-            f.structDef = compileFields(fd[2]);
+            f.structDef = compileFields(fd[2], true);
             f.write = createStructWriter(f.structDef);
             f.read = createStructReader(f.structDef);
         } else if (ftype === 'array' && fd[2]) {
@@ -515,7 +633,7 @@ function compileFields(fieldDefs) {
             f.fixedSize = typeDef.size;
             f.variants = {};
             for (var key in fd[2]) {
-                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key]);
+                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key], nested);
             }
         } else {
             // Regular field
@@ -622,9 +740,17 @@ function createBitsReader(def) {
 
 // ── Enum compiler ───────────────────────────────────────────
 
+function buildIndexMap(opts) {
+    // O(1) value→index lookup, built once at compile — indexOf is O(n) per call
+    var m = {};
+    for (var i = 0; i < opts.length; i++) m[opts[i]] = i;
+    return m;
+}
+
 function createEnumWriter(opts, fieldName) {
+    var idxMap = buildIndexMap(opts);
     return function(val, buf, pos) {
-        var idx = opts.indexOf(val);
+        var idx = idxMap[val] !== undefined ? idxMap[val] : -1;
         if (idx === -1) {
             // Silently encoding index 0 would turn a typo into a DIFFERENT valid value.
             // Numeric passthrough is allowed for forward-compat (value from a newer peer).
@@ -650,11 +776,12 @@ function createEnumReader(opts) {
 var MAX_SET_OPTIONS = 52;
 
 function createSetWriter(opts, fieldName) {
+    var idxMap = buildIndexMap(opts);
     return function(val, buf, pos) {
         var mask = 0;
         if (val) {
             for (var i = 0; i < val.length; i++) {
-                var idx = opts.indexOf(val[i]);
+                var idx = idxMap[val[i]] !== undefined ? idxMap[val[i]] : -1;
                 if (idx === -1) {
                     throw new Error("litepack: field '" + fieldName + "' — unknown set value " + JSON.stringify(val[i]) + ' (options: ' + opts.join(', ') + ')');
                 }
@@ -690,10 +817,71 @@ function createFixedWriter(len) {
     };
 }
 
+// ── Map: varint count + (key, value) pairs ───────────────────────────
+// Keys arrive as JS object keys (always strings) — numeric key types are
+// Number()ed on write and become object keys again on read.
+function compileMap(fd, fname) {
+    var keyType = fd[2];
+    var valType = fd[3];
+    var def = { keyField: makeSimpleField(keyType, fname + '.<key>'), numericKeys: keyType !== 'string' };
+    if (valType === 'struct') {
+        if (!Array.isArray(fd[4])) {
+            throw new Error("litepack: field '" + fname + "' — map with struct values needs a schema: ['" + fname + "', 'map', '" + keyType + "', 'struct', [...]]");
+        }
+        var sd = compileFields(fd[4], true);
+        def.valField = { type: 'struct', fixedSize: null, structDef: sd,
+                         write: createStructWriter(sd), read: createStructReader(sd) };
+    } else {
+        def.valField = makeSimpleField(valType, fname + '.<value>');
+    }
+    return def;
+}
+
+function makeSimpleField(typeName, ctx) {
+    if (typeName === 'array' || typeName === 'map' || typeName === 'bits' || typeName === 'tail' || typeName === 'const' || typeName === 'fixed') {
+        throw new Error("litepack: '" + typeName + "' is not supported here (" + ctx + ") — wrap it in a struct");
+    }
+    var t = resolveType(typeName, ctx);
+    return { type: typeName, fixedSize: t.size, write: t.write, read: t.read };
+}
+
+function createMapWriter(def, fieldName) {
+    return function(val, buf, pos) {
+        var keys = val ? Object.keys(val) : [];
+        var start = pos;
+        pos += writeVarint(keys.length, buf, pos);
+        for (var i = 0; i < keys.length; i++) {
+            var k = def.numericKeys ? Number(keys[i]) : keys[i];
+            pos += def.keyField.write(k, buf, pos);
+            pos += def.valField.write(val[keys[i]], buf, pos);
+        }
+        return pos - start;
+    };
+}
+
+function createMapReader(def) {
+    var minPair = (def.keyField.fixedSize || 1) + (def.valField.fixedSize || 1);
+    return function(buf, pos) {
+        var start = pos;
+        var cr = readVarint(buf, pos);
+        pos += cr.bytesRead;
+        if (cr.value * minPair > buf.length - pos) {
+            throw truncErr('litepack: map at byte ' + start + ' needs more bytes (count ' + cr.value + ', ' + (buf.length - pos) + ' remain)');
+        }
+        var out = {};
+        for (var i = 0; i < cr.value; i++) {
+            var kr = def.keyField.read(buf, pos); pos += kr.bytesRead;
+            var vr = def.valField.read(buf, pos); pos += vr.bytesRead;
+            out[kr.value] = vr.value;
+        }
+        return { value: out, bytesRead: pos - start };
+    };
+}
+
 function createFixedReader(len) {
     return function(buf, pos) {
         if (pos + len > buf.length) {
-            throw new Error('litepack: truncated fixed(' + len + ') at byte ' + pos);
+            throw truncErr('litepack: truncated fixed(' + len + ') at byte ' + pos);
         }
         return { value: buf.subarray(pos, pos + len), bytesRead: len };
     };
@@ -720,18 +908,23 @@ function createStructReader(compiled) {
 
 // ── Array compiler ──────────────────────────────────────────
 
+var UNSUPPORTED_ARRAY_ITEM = { array: 1, map: 1, bits: 1, fixed: 1, tail: 1, 'const': 1 };
+
 function compileArrayItem(fd) {
     // fd = ['name', 'array', itemType, itemDef?, fixedCount?]
     var itemType = fd[2];
     if (typeof itemType !== 'string') {
         throw new Error("litepack: field '" + fd[0] + "' — array requires an item type, e.g. ['" + fd[0] + "', 'array', 'uint16']");
     }
+    if (UNSUPPORTED_ARRAY_ITEM[itemType]) {
+        throw new Error("litepack: field '" + fd[0] + "' — '" + itemType + "' is not supported directly as an array item; wrap it in a struct, e.g. ['" + fd[0] + "', 'array', 'struct', [['inner', '" + itemType + "', ...]]]");
+    }
     var itemField = { type: itemType, fixedSize: null };
     var nextIdx = 3;
     var fixedCount = null;
 
     if (itemType === 'struct' && Array.isArray(fd[nextIdx])) {
-        itemField.structDef = compileFields(fd[nextIdx]);
+        itemField.structDef = compileFields(fd[nextIdx], true);
         itemField.write = createStructWriter(itemField.structDef);
         itemField.read = createStructReader(itemField.structDef);
         nextIdx++;
@@ -800,7 +993,7 @@ function createArrayReader(itemField, fixedCount) {
             pos += cr.bytesRead;
         }
         if (count * minItemSize > buf.length - pos) {
-            throw new Error('litepack: malformed array at byte ' + start + ' (count ' + count + ' cannot fit in ' + (buf.length - pos) + ' remaining bytes)');
+            throw truncErr('litepack: array at byte ' + start + ' needs more bytes (count ' + count + ', ' + (buf.length - pos) + ' remain)');
         }
         var arr = new Array(count);
         for (var i = 0; i < count; i++) {
@@ -861,16 +1054,19 @@ function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
 
     for (var i = 0; i < fields.length; i++) {
         var f = fields[i];
-        if (f.optional && !bitmaskHas(bitmask, f)) continue;
+        if (f.optional && !bitmaskHas(bitmask, f)) {
+            if (f.hasDefault) data[f.name] = cloneDefault(f.defaultValue);
+            continue;
+        }
 
         if (pos >= bufEnd && !f.isTail) {
-            throw new Error("litepack: truncated input — buffer ended before field '" + f.name + "'");
+            throw truncErr("litepack: truncated input — buffer ended before field '" + f.name + "'");
         }
         var result = f.isTail ? f.read(buf, pos, bufEnd) : f.read(buf, pos);
         data[f.name] = result.value;
         pos += result.bytesRead;
         if (pos > bufEnd) {
-            throw new Error("litepack: truncated input — field '" + f.name + "' ran past end of buffer");
+            throw truncErr("litepack: truncated input — field '" + f.name + "' ran past end of buffer");
         }
 
         if (f.variants) {
@@ -922,6 +1118,16 @@ function estimateSingleField(f, val) {
             return varintSize(mask);
         case 'fixed':
             return f.fixedLen;
+        case 'const':
+            return estimateSingleField({ type: f.constBaseType, fixedSize: f.fixedSize }, f.constValue);
+        case 'map':
+            var mk = val ? Object.keys(val) : [];
+            var ms = varintSize(mk.length);
+            for (var j = 0; j < mk.length; j++) {
+                ms += estimateSingleField(f.mapDef.keyField, f.mapDef.numericKeys ? Number(mk[j]) : mk[j]);
+                ms += estimateSingleField(f.mapDef.valField, val[mk[j]]);
+            }
+            return ms;
         case 'struct':
             return estimateFieldSize(f.structDef.fields, f.structDef.optionalCount, val || {});
         case 'array':
@@ -1012,8 +1218,17 @@ litepack.encode = function(schema, data) {
  * @param {Uint8Array|ArrayBuffer} buf
  * @returns {Object}
  */
-litepack.decode = function(schema, buf) {
+// {copy:true}: one clone of the WHOLE input up front. Every zero-copy view
+// (bytes/fixed/uuid/tail) then points into OUR private copy — the caller can
+// recycle or mutate their original buffer freely. One allocation, total safety.
+function normalizeBuf(buf, opts) {
     if (buf instanceof ArrayBuffer) buf = new Uint8Array(buf);
+    if (opts && opts.copy) buf = new Uint8Array(buf);
+    return buf;
+}
+
+litepack.decode = function(schema, buf, opts) {
+    buf = normalizeBuf(buf, opts);
     var c = compileDef(schema);
     var data = {};
     decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
@@ -1068,8 +1283,8 @@ litepack.compile = function(schema) {
             if (pos > buf.length) throw new Error('litepack: encoded size exceeded estimate — custom codec with non-deterministic encode()?');
             return buf.subarray(0, pos);
         },
-        decode: function(buf) {
-            if (buf instanceof ArrayBuffer) buf = new Uint8Array(buf);
+        decode: function(buf, opts) {
+            buf = normalizeBuf(buf, opts);
             var data = {};
             decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
             return data;
@@ -1087,9 +1302,9 @@ litepack.compile = function(schema) {
  *   var msg = litepack.tryDecode(proto, e.data.data);
  *   if (!msg) return;   // malformed / truncated / hostile — drop it
  */
-litepack.tryDecode = function(schema, buf) {
+litepack.tryDecode = function(schema, buf, opts) {
     try {
-        return litepack.decode(schema, buf);
+        return litepack.decode(schema, buf, opts);
     } catch (e) {
         return null;
     }
@@ -1102,6 +1317,139 @@ litepack.tryDecode = function(schema, buf) {
 litepack.byteLength = function(schema, data) {
     var c = compileDef(schema);
     return estimateFieldSize(c.fields, c.optionalCount, data || {});
+};
+
+// =========================================================================
+// Streaming / composition — for frames that carry MORE than one message.
+//
+// decode() answers "what is in this buffer"; these answer "what is NEXT in
+// this buffer". Message framing (header proto + body proto, or N packed
+// messages) stops being manual Uint8Array surgery:
+//
+//   // read: header decides which body proto to use
+//   var r = litepack.reader(frame);
+//   var head = r.read(headerProto);
+//   var body = r.read(head.sub === SUB.LIST ? listBodyProto : scalarBodyProto);
+//
+//   // write: pack several messages into one frame, single allocation
+//   var frame = litepack.writer()
+//       .write(headerProto, { type: 64, sub: 5 })
+//       .write(scalarBodyProto, { subjectPeerId: id, value: 1 })
+//       .bytes();
+//
+// Wire format note: chaining protoA then protoB produces byte-identical
+// output to one merged proto with the same fields IN THE SAME ORDER — as
+// long as each part keeps its own optionals. (Schemas are plain arrays, so
+// headerProto.concat(bodyProto) is also a valid merged schema.)
+// =========================================================================
+
+/**
+ * Decode one message starting at `offset`. Returns { value, bytesRead } —
+ * the primitive that decode() hides. Trailing bytes are left alone.
+ */
+litepack.decodeFrom = function(schema, buf, offset, opts) {
+    buf = normalizeBuf(buf, opts);
+    offset = offset || 0;
+    var c = compileDef(schema);
+    var data = {};
+    var end = decodeFields(c.fields, c.optionalCount, buf, offset, data, buf.length);
+    return { value: data, bytesRead: end - offset };
+};
+
+/**
+ * Encode `data` directly into an existing buffer at `offset`.
+ * Returns bytes written. Throws if it will not fit — typed-array
+ * out-of-bounds writes are silently dropped, never rely on them.
+ */
+litepack.encodeInto = function(schema, data, buf, offset) {
+    offset = offset || 0;
+    data = data || {};
+    var c = compileDef(schema);
+    var need = estimateFieldSize(c.fields, c.optionalCount, data);
+    if (offset + need > buf.length) {
+        throw new Error('litepack: encodeInto needs ' + need + ' bytes at offset ' + offset + ', buffer has ' + (buf.length - offset));
+    }
+    return encodeFields(c.fields, c.optionalCount, data, buf, offset) - offset;
+};
+
+/** Concatenate Uint8Arrays into one (single allocation). */
+litepack.concat = function(list) {
+    var total = 0, i;
+    for (i = 0; i < list.length; i++) total += list[i].length;
+    var out = new Uint8Array(total);
+    var pos = 0;
+    for (i = 0; i < list.length; i++) { out.set(list[i], pos); pos += list[i].length; }
+    return out;
+};
+
+/**
+ * Sequential reading cursor over a buffer holding chained messages.
+ *   r.read(proto)     — decode next message, advance (throws on malformed)
+ *   r.tryRead(proto)  — same, but null on malformed (cursor NOT advanced)
+ *   r.peek(proto)     — decode without advancing
+ *   r.remaining()     — bytes left
+ *   r.eof()           — no bytes left
+ *   r.skip(n)         — advance n bytes (e.g. past a foreign message)
+ *   r.offset          — current position
+ */
+litepack.reader = function(buf, opts) {
+    buf = normalizeBuf(buf, opts);
+    var r = {
+        offset: 0,
+        read: function(schema) {
+            var res = litepack.decodeFrom(schema, buf, r.offset);
+            r.offset += res.bytesRead;
+            return res.value;
+        },
+        tryRead: function(schema) {
+            try { return r.read(schema); } catch (e) { return null; }
+        },
+        peek: function(schema) {
+            return litepack.decodeFrom(schema, buf, r.offset).value;
+        },
+        skip: function(n) { r.offset += n; return r; },
+        remaining: function() { return buf.length - r.offset; },
+        eof: function() { return r.offset >= buf.length; }
+    };
+    return r;
+};
+
+/**
+ * Chained-message builder. Collects (schema, data) pairs, then emits one
+ * exactly-sized buffer — no intermediate arrays, no manual concat.
+ *   litepack.writer().write(a, d1).write(b, d2).bytes()
+ */
+litepack.writer = function() {
+    var parts = [];     // [compiled, data, size]
+    var total = 0;
+    var w = {
+        write: function(schema, data) {
+            var c = compileDef(schema);
+            data = data || {};
+            var size = estimateFieldSize(c.fields, c.optionalCount, data);
+            parts.push([c, data, size]);
+            total += size;
+            return w;
+        },
+        raw: function(bytes) {           // splice in pre-encoded/foreign bytes
+            parts.push([null, bytes, bytes.length]);
+            total += bytes.length;
+            return w;
+        },
+        byteLength: function() { return total; },
+        bytes: function() {
+            var buf = new Uint8Array(total);
+            var pos = 0;
+            for (var i = 0; i < parts.length; i++) {
+                var p = parts[i];
+                if (p[0] === null) { buf.set(p[1], pos); pos += p[2]; }
+                else pos = encodeFields(p[0].fields, p[0].optionalCount, p[1], buf, pos);
+            }
+            if (pos > buf.length) throw new Error('litepack: writer overflow — custom codec with non-deterministic encode()?');
+            return pos === total ? buf : buf.subarray(0, pos);
+        }
+    };
+    return w;
 };
 
 /**
@@ -1153,7 +1501,7 @@ litepack.codec('json', {
     decode: function(b) { return JSON.parse(utf8Decode(b, 0, b.length)); }
 });
 
-litepack.version = '1.1.0';
+litepack.version = '1.2.0';
 
 return litepack;
 
