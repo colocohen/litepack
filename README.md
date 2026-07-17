@@ -254,13 +254,65 @@ the value is uniformly distributed (hashes, colors) — a varint would
 `fixed` saves the length prefix when the size is known — a SHA-256 hash is
 32 bytes on the wire, not 33. `tail` saves it for the final variable blob.
 
-> `tail` must be the **last field of a top-level schema**. Inside a nested
-> struct or array item there is no defined end — the compiler throws with a
-> clear message (use `bytes` there instead).
->
 > ⚠️ On decode, `bytes` / `fixed` / `tail` return **views** into the input
 > buffer (zero-copy, fast). If you reuse or mutate the network buffer after
-> decoding, copy first: `new Uint8Array(msg.payload)`.
+> decoding, copy first: `new Uint8Array(msg.payload)` — or decode with
+> `{copy: true}`.
+
+#### Understanding `tail`
+
+The idea behind `tail` is one simple observation: **your transport already
+knows where the message ends.** A WebSocket frame, a datagram, a
+length-prefixed TCP frame — they all carry a message boundary. So a length
+prefix on the *final* blob inside the message is redundant information.
+`tail` deletes it: "everything from here to the end of the buffer".
+
+Where it shines:
+
+**1. Envelope + opaque payload (tunneling).** A relay forwards a message
+without understanding its contents — it reads the header and passes the
+`tail` along untouched:
+
+```js
+var envelopeProto = [
+    ['type',     'const', 'uint8', MSG.RELAY],
+    ['fromPeer', 'varint'],
+    ['toPeer',   'varint'],
+    ['payload',  'tail']          // a complete inner message — not our business
+];
+
+// Layered protocols fall out naturally — the tail is itself decodable:
+var outer = litepack.tryDecode(envelopeProto, wireBytes);
+var inner = litepack.tryDecode(innerProto, outer.payload);
+```
+
+**2. Small header + big data (file/media chunks).** The byte saved by the
+missing prefix is nice; the real win is **zero-copy** — the decoded `tail`
+is a view into the receive buffer, so a 16 KB chunk is never copied:
+
+```js
+var chunkProto = [
+    ['fileId',     'varint'],
+    ['chunkIndex', 'varint'],
+    ['data',       'tail']
+];
+```
+
+**3. Signed raw bytes.** `header + the exact bytes that were signed` —
+`tail` hands them back byte-for-byte, untouched by any encoding.
+
+**`bytes` vs `tail` — the rule:** use `bytes` when something comes after
+it, or when it lives inside a struct or array item (a length is *needed*
+to know where it ends). Use `tail` when it's the last thing in the message
+and framing is the transport's job. That's also why the compiler enforces
+"last field of a top-level schema only" — it's not an arbitrary limit,
+it's the definition of when `tail` is meaningful at all. Inside nested
+structs/arrays the compiler throws with a clear message pointing you to
+`bytes`.
+
+Put together, `[const opcode] [header fields] [tail payload]` is the
+template for a near-perfect protocol message: every byte on the wire is
+real information, zero structural overhead.
 
 ### Const (protocol constants)
 
