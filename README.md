@@ -254,6 +254,12 @@ the value is uniformly distributed (hashes, colors) — a varint would
 `fixed` saves the length prefix when the size is known — a SHA-256 hash is
 32 bytes on the wire, not 33. `tail` saves it for the final variable blob.
 
+`fixed` and `uuid` are **strict on encode**: the value must be bytes
+(`Uint8Array`, `Buffer`, or an array of numbers) of exactly that length.
+Anything else throws — a 64-character hex string given to `['hash','fixed',32]`
+is a bug, not 32 bytes to cut it to. Decode hex/base64 to bytes first. A
+missing value (`undefined`/`null`) encodes as zeros, like any missing scalar.
+
 > ⚠️ On decode, `bytes` / `fixed` / `tail` return **views** into the input
 > buffer (zero-copy, fast). If you reuse or mutate the network buffer after
 > decoding, copy first: `new Uint8Array(msg.payload)` — or decode with
@@ -498,7 +504,8 @@ through your code.
 #### `litepack.encode(schema, data)` → `Uint8Array`
 
 **Throws** on invalid data: unknown enum/set values, negative `varint`,
-values above 2^53-1, misplaced `tail`. Missing optional fields are free;
+values above 2^53-1, out-of-range fixed-width integers, a `fixed`/`uuid`
+value that is not bytes of exactly the declared length, misplaced `tail`. Missing optional fields are free;
 missing required scalars encode as zero-values (see `assertComplete` to
 forbid that).
 
@@ -836,7 +843,7 @@ Two trust levels, by design:
 
 | Direction | Policy | Why |
 |---|---|---|
-| **encode** (your data) | strict — throws on typos, negatives, overflow, misplaced `tail` | a bug in *your* code should explode in dev, not ship corrupted bytes |
+| **encode** (your data) | strict — throws on typos, negatives, overflow, wrong-length `fixed`/`uuid`, misplaced `tail` | a bug in *your* code should explode in dev, not ship corrupted bytes |
 | **decode** (their data) | defensive — bounded, validated; throws (or `tryDecode` → `null`) on anything malformed | wire input is attacker-controlled; garbage in must never mean garbage out, OOM, or a CPU spin |
 
 Decode hard limits: varints capped at 8 bytes; array counts validated
@@ -904,6 +911,9 @@ Behavior changes to be aware of:
   packed correctly.
 * `tail` outside the last top-level position is now a compile-time error
   (previously corrupted silently).
+* (1.2.2) `fixed` and `uuid` throw on a value of the wrong length or that is
+  not bytes (previously cut, zero-padded, or — for a string — written as
+  zeros, silently).
 * New types: `svarint`, `int64`, `json`, `const`, `map`, `uuid`,
   `timestamp`. New API: `compile`, `tryDecode`, `byteLength`,
   `assertComplete`, `reader`, `writer`, `decodeFrom`, `encodeInto`,

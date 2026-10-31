@@ -23,6 +23,9 @@
 //   non-number      → 0 (lenient for missing/undefined)
 // Decode side is DEFENSIVE (wire data — bounded, never trusts input):
 //   max 8 bytes (56 bits > 2^53 cap) → throw on longer sequences
+//   > 2^53-1 (only possible in an 8-byte varint) → throw: past that a double
+//   rounds, so two DIFFERENT wire values could decode to the SAME number
+//   (two ids colliding) instead of failing
 
 var MAX_VARINT_BYTES = 8;
 
@@ -37,10 +40,30 @@ function truncErr(msg) {
 }
 
 function writeVarint(val, buf, pos) {
+    // Fast path: non-negative values below 2^31 (almost every length, id and
+    // counter) — plain 32-bit ops instead of Math.floor / % (same bytes).
+    if (typeof val === 'number' && val >= 0 && val < 0x80000000) {
+        val = val | 0;   // == Math.floor for non-negative
+        if (val < 0x80) { buf[pos] = val; return 1; }
+        var p0 = pos;
+        do { buf[pos++] = (val & 0x7F) | 0x80; val >>>= 7; } while (val > 0x7F);
+        buf[pos++] = val;
+        return pos - p0;
+    }
     if (typeof val !== 'number') val = 0;
     else if (val < 0) throw new Error("litepack: varint cannot encode negative value " + val + " (use 'svarint' for signed)");
     else if (val > 9007199254740991) throw new Error('litepack: varint value ' + val + ' exceeds 2^53-1 (use uint64)');
     val = Math.floor(val);
+    if (val >= 0x80000000) {
+        // 2^31..2^53-1 (e.g. ms timestamps): low 28 bits as 4 groups, then the
+        // rest (< 2^25) with 32-bit ops — exact integer math, same bytes.
+        var lo = val % 0x10000000, hi = (val - lo) / 0x10000000, p1 = pos;
+        buf[pos++] = (lo & 0x7F) | 0x80; buf[pos++] = ((lo >>> 7) & 0x7F) | 0x80;
+        buf[pos++] = ((lo >>> 14) & 0x7F) | 0x80; buf[pos++] = ((lo >>> 21) & 0x7F) | 0x80;
+        while (hi > 0x7F) { buf[pos++] = (hi & 0x7F) | 0x80; hi >>>= 7; }
+        buf[pos++] = hi;
+        return pos - p1;
+    }
     var start = pos;
     while (val > 0x7F) {
         buf[pos++] = (val % 128) | 0x80;
@@ -50,7 +73,14 @@ function writeVarint(val, buf, pos) {
     return pos - start;
 }
 
+// Readers return the VALUE and leave the number of bytes they consumed in
+// _n — no { value, bytesRead } object per field. Read _n right after the
+// call, before any other read can overwrite it.
+var _n = 0;
+
 function readVarint(buf, pos) {
+    var b0 = buf[pos];
+    if (b0 < 0x80) { _n = 1; return b0; }   // 1-byte fast path (undefined → slow path → truncErr)
     var val = 0, n = 0, b, mul = 1;
     do {
         if (n >= MAX_VARINT_BYTES) throw new Error('litepack: malformed varint (too long) at byte ' + (pos - n));
@@ -60,10 +90,17 @@ function readVarint(buf, pos) {
         mul *= 128;
         n++;
     } while (b & 0x80);
-    return { value: val, bytesRead: n };
+    if (n === MAX_VARINT_BYTES && val > 9007199254740991) {
+        throw new Error('litepack: varint at byte ' + (pos - n) + ' exceeds 2^53-1 (would lose precision)');
+    }
+    _n = n;
+    return val;
 }
 
 function varintSize(val) {
+    if (typeof val === 'number' && val >= 0 && val < 0x80000000) {
+        return val < 0x80 ? 1 : val < 0x4000 ? 2 : val < 0x200000 ? 3 : val < 0x10000000 ? 4 : 5;
+    }
     if (typeof val !== 'number' || val < 0) val = 0;
     val = Math.floor(val);
     var n = 1;
@@ -157,27 +194,39 @@ var _codecs = {};
 var TYPES = {};
 
 // Fixed-size integers
+//
+// Unsigned encode is STRICT, like varint: a number outside the type's range
+// throws instead of being silently masked (300 as uint8 used to go out as 44 —
+// for a message-type field, that is a DIFFERENT message). Non-numbers stay
+// lenient (undefined → 0, true → 1), as before.
+function checkUint(v, max, name) {
+    if (typeof v === 'number' && (v < 0 || v > max)) {
+        throw new Error('litepack: ' + name + ' value ' + v + ' out of range 0..' + max);
+    }
+}
+
 TYPES.uint8 = {
     size: 1,
-    write: function(v, buf, pos) { buf[pos] = v & 0xFF; return 1; },
-    read:  function(buf, pos) { return { value: buf[pos], bytesRead: 1 }; }
+    write: function(v, buf, pos) { checkUint(v, 0xFF, 'uint8'); buf[pos] = v & 0xFF; return 1; },
+    read:  function(buf, pos) { var _v = buf[pos]; _n = 1; return _v; }
 };
 
 TYPES.int8 = {
     size: 1,
     write: function(v, buf, pos) { buf[pos] = v & 0xFF; return 1; },
-    read:  function(buf, pos) { var x = buf[pos]; return { value: x > 127 ? x - 256 : x, bytesRead: 1 }; }
+    read:  function(buf, pos) { var x = buf[pos]; var _v = x > 127 ? x - 256 : x; _n = 1; return _v; }
 };
 
 TYPES.uint16 = {
     size: 2,
     write: function(v, buf, pos) {
+        checkUint(v, 0xFFFF, 'uint16');
         buf[pos] = (v >> 8) & 0xFF;
         buf[pos + 1] = v & 0xFF;
         return 2;
     },
     read: function(buf, pos) {
-        return { value: (buf[pos] << 8) | buf[pos + 1], bytesRead: 2 };
+        var _v = (buf[pos] << 8) | buf[pos + 1]; _n = 2; return _v;
     }
 };
 
@@ -190,13 +239,14 @@ TYPES.int16 = {
     },
     read: function(buf, pos) {
         var x = (buf[pos] << 8) | buf[pos + 1];
-        return { value: x > 32767 ? x - 65536 : x, bytesRead: 2 };
+        var _v = x > 32767 ? x - 65536 : x; _n = 2; return _v;
     }
 };
 
 TYPES.uint32 = {
     size: 4,
     write: function(v, buf, pos) {
+        checkUint(v, 0xFFFFFFFF, 'uint32');
         buf[pos]     = (v >>> 24) & 0xFF;
         buf[pos + 1] = (v >>> 16) & 0xFF;
         buf[pos + 2] = (v >>> 8) & 0xFF;
@@ -204,7 +254,7 @@ TYPES.uint32 = {
         return 4;
     },
     read: function(buf, pos) {
-        return { value: ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0, bytesRead: 4 };
+        var _v = ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0; _n = 4; return _v;
     }
 };
 
@@ -218,7 +268,7 @@ TYPES.int32 = {
         return 4;
     },
     read: function(buf, pos) {
-        return { value: (buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3], bytesRead: 4 };
+        var _v = (buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]; _n = 4; return _v;
     }
 };
 
@@ -250,7 +300,7 @@ TYPES.uint64 = {
         if (v > 9007199254740991 && typeof BigInt !== 'undefined') {
             v = (BigInt(hi) << BigInt(32)) | BigInt(lo);
         }
-        return { value: v, bytesRead: 8 };
+        var _v = v; _n = 8; return _v;
     }
 };
 
@@ -286,7 +336,7 @@ TYPES.int64 = {
                 v = (BigInt(hi) << BigInt(32)) | BigInt(lo);
             }
         }
-        return { value: v, bytesRead: 8 };
+        var _v = v; _n = 8; return _v;
     }
 };
 
@@ -312,7 +362,7 @@ TYPES.float32 = {
     },
     read: function(buf, pos) {
         _u8[0] = buf[pos]; _u8[1] = buf[pos + 1]; _u8[2] = buf[pos + 2]; _u8[3] = buf[pos + 3];
-        return { value: _dv.getFloat32(0, false), bytesRead: 4 };
+        var _v = _dv.getFloat32(0, false); _n = 4; return _v;
     }
 };
 
@@ -325,7 +375,7 @@ TYPES.float64 = {
     },
     read: function(buf, pos) {
         for (var i = 0; i < 8; i++) _u8[i] = buf[pos + i];
-        return { value: _dv.getFloat64(0, false), bytesRead: 8 };
+        var _v = _dv.getFloat64(0, false); _n = 8; return _v;
     }
 };
 
@@ -333,7 +383,7 @@ TYPES.float64 = {
 TYPES.bool = {
     size: 1,
     write: function(v, buf, pos) { buf[pos] = v ? 1 : 0; return 1; },
-    read:  function(buf, pos) { return { value: buf[pos] !== 0, bytesRead: 1 }; }
+    read:  function(buf, pos) { var _v = buf[pos] !== 0; _n = 1; return _v; }
 };
 
 // Varint
@@ -343,17 +393,37 @@ TYPES.varint = {
     read:  function(buf, pos) { return readVarint(buf, pos); }
 };
 
+// Exactly-N-bytes values (fixed, uuid) — STRICT on encode, like the integers:
+// the length IS the type, so a value of any other length is a bug in the
+// caller, and is thrown rather than cut or zero-padded. A 64-character hex
+// SHA-256 given to ['hash','fixed',32] used to be cut to its first 32 bytes
+// (32 hex CHARACTERS) — a different hash, silently. A string went in as
+// zeros: Uint8Array.set reads its characters as NaN.
+// Missing (undefined/null) stays lenient — N zero bytes — as every other
+// missing scalar encodes as its zero value (assertComplete forbids that).
+function writeExact(v, len, buf, pos, name) {
+    if (v === undefined || v === null) {
+        for (var i = 0; i < len; i++) buf[pos + i] = 0;
+        return len;
+    }
+    if (!ArrayBuffer.isView(v) && !Array.isArray(v)) {
+        throw new Error('litepack: ' + name + ' expects ' + len + ' bytes (Uint8Array), got ' + typeof v +
+                        (typeof v === 'string' ? ' — decode hex/base64 to bytes first' : ''));
+    }
+    if (v.length !== len) {
+        throw new Error('litepack: ' + name + ' expects exactly ' + len + ' bytes, got ' + v.length);
+    }
+    buf.set(v, pos);
+    return len;
+}
+
 // UUID / 16-byte ids — exactly 16 bytes, no length prefix
 TYPES.uuid = {
     size: 16,
-    write: function(v, buf, pos) {
-        if (v && v.length) buf.set(v.subarray ? v.subarray(0, 16) : v, pos);
-        else for (var i = 0; i < 16; i++) buf[pos + i] = 0;
-        return 16;
-    },
+    write: function(v, buf, pos) { return writeExact(v, 16, buf, pos, 'uuid'); },
     read: function(buf, pos) {
         if (pos + 16 > buf.length) throw truncErr('litepack: truncated uuid at byte ' + pos);
-        return { value: buf.subarray(pos, pos + 16), bytesRead: 16 };
+        var _v = buf.subarray(pos, pos + 16); _n = 16; return _v;
     }
 };
 
@@ -365,8 +435,7 @@ TYPES.svarint = {
         return writeVarint(zigzag(Math.round(v)), buf, pos);
     },
     read: function(buf, pos) {
-        var r = readVarint(buf, pos);
-        return { value: unzigzag(r.value), bytesRead: r.bytesRead };
+        return unzigzag(readVarint(buf, pos));   // _n already set by readVarint
     }
 };
 
@@ -377,6 +446,21 @@ TYPES.string = {
     size: null,
     write: function(v, buf, pos) {
         var s = v == null ? '' : String(v);
+        // ASCII fast path: copy char codes straight into buf. The old path's
+        // buf.subarray() for encodeInto forces a small (on-heap) output
+        // buffer out to a real ArrayBuffer — slower than the rest of encode.
+        // On the first non-ASCII char, fall through to the full path, which
+        // rewrites the field from the start (same bytes as before).
+        var sl = s.length;
+        if (sl < 0x80) {
+            var i = 0, q = pos + 1;
+            for (; i < sl; i++) {
+                var c = s.charCodeAt(i);
+                if (c >= 0x80) break;
+                buf[q + i] = c;
+            }
+            if (i === sl) { buf[pos] = sl; return sl + 1; }
+        }
         var len = utf8ByteLength(s);
         var lb = writeVarint(len, buf, pos);
         if (_hasEncodeInto) {
@@ -388,11 +472,11 @@ TYPES.string = {
         return lb + len;
     },
     read: function(buf, pos) {
-        var l = readVarint(buf, pos);
-        if (pos + l.bytesRead + l.value > buf.length) {
-            throw truncErr('litepack: truncated string at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - pos - l.bytesRead) + ' remain)');
+        var len = readVarint(buf, pos), lb = _n;
+        if (pos + lb + len > buf.length) {
+            throw truncErr('litepack: truncated string at byte ' + pos + ' (declared ' + len + ' bytes, ' + (buf.length - pos - lb) + ' remain)');
         }
-        return { value: utf8Decode(buf, pos + l.bytesRead, l.value), bytesRead: l.bytesRead + l.value };
+        var _v = utf8Decode(buf, pos + lb, len); _n = lb + len; return _v;
     }
 };
 
@@ -406,12 +490,12 @@ TYPES.bytes = {
         return lb + d.length;
     },
     read: function(buf, pos) {
-        var l = readVarint(buf, pos);
-        var s = pos + l.bytesRead;
-        if (s + l.value > buf.length) {
-            throw truncErr('litepack: truncated bytes at byte ' + pos + ' (declared ' + l.value + ' bytes, ' + (buf.length - s) + ' remain)');
+        var len = readVarint(buf, pos), lb = _n;
+        var s = pos + lb;
+        if (s + len > buf.length) {
+            throw truncErr('litepack: truncated bytes at byte ' + pos + ' (declared ' + len + ' bytes, ' + (buf.length - s) + ' remain)');
         }
-        return { value: buf.subarray(s, s + l.value), bytesRead: l.bytesRead + l.value };
+        var _v = buf.subarray(s, s + len); _n = lb + len; return _v;
     }
 };
 
@@ -427,7 +511,7 @@ TYPES.tail = {
         return d.length;
     },
     read: function(buf, pos, end) {
-        return { value: buf.subarray(pos, end), bytesRead: end - pos };
+        var _v = buf.subarray(pos, end); _n = end - pos; return _v;
     }
 };
 
@@ -600,18 +684,18 @@ function compileFields(fieldDefs, nested) {
             })(cBase, cVal);
             f.read = (function(base, cv, nm) {
                 return function(buf, pos) {
-                    var r = base.read(buf, pos);
-                    if (r.value !== cv) {
-                        throw new Error("litepack: field '" + nm + "' — const mismatch (expected " + JSON.stringify(cv) + ", got " + JSON.stringify(r.value) + ')');
+                    var v = base.read(buf, pos);   // _n set by base.read
+                    if (v !== cv) {
+                        throw new Error("litepack: field '" + nm + "' — const mismatch (expected " + JSON.stringify(cv) + ", got " + JSON.stringify(v) + ')');
                     }
-                    return r;
+                    return v;
                 };
             })(cBase, cVal, fname);
         } else if (ftype === 'fixed' && fd[2]) {
             // Fixed-length bytes — no length prefix
             f.fixedLen = fd[2];
             f.fixedSize = fd[2];
-            f.write = createFixedWriter(fd[2]);
+            f.write = createFixedWriter(fd[2], fname);
             f.read = createFixedReader(fd[2]);
         } else if (ftype === 'struct' && fd[2]) {
             // Nested struct
@@ -720,7 +804,7 @@ function createBitsReader(def) {
             remaining -= sf.width;
             result[sf.name] = (packed >>> remaining) & ((1 << sf.width) - 1);
         }
-        return { value: result, bytesRead: def.totalBytes };
+        var _v = result; _n = def.totalBytes; return _v;
     };
     return function(buf, pos) {
         var result = {};
@@ -734,7 +818,7 @@ function createBitsReader(def) {
             }
             result[sf.name] = v;
         }
-        return { value: result, bytesRead: def.totalBytes };
+        var _v = result; _n = def.totalBytes; return _v;
     };
 }
 
@@ -764,8 +848,8 @@ function createEnumWriter(opts, fieldName) {
 
 function createEnumReader(opts) {
     return function(buf, pos) {
-        var r = readVarint(buf, pos);
-        return { value: r.value < opts.length ? opts[r.value] : r.value, bytesRead: r.bytesRead };
+        var v = readVarint(buf, pos);   // _n set by readVarint
+        return v < opts.length ? opts[v] : v;
     };
 }
 
@@ -795,26 +879,22 @@ function createSetWriter(opts, fieldName) {
 
 function createSetReader(opts) {
     return function(buf, pos) {
-        var r = readVarint(buf, pos);
+        var mask = readVarint(buf, pos), lb = _n;
         var arr = [];
-        var mask = r.value;
         for (var i = 0; i < opts.length && mask > 0; i++) {
             if (mask % 2 === 1) arr.push(opts[i]);
             mask = Math.floor(mask / 2);
         }
-        return { value: arr, bytesRead: r.bytesRead };
+        _n = lb; return arr;
     };
 }
 
 // ── Fixed compiler ──────────────────────────────────────────
 
-function createFixedWriter(len) {
-    return function(val, buf, pos) {
-        var d = val || new Uint8Array(len);
-        buf.set(d.length > len ? d.subarray(0, len) : d, pos);
-        if (d.length < len) for (var i = d.length; i < len; i++) buf[pos + i] = 0;
-        return len;
-    };
+// Exactly len bytes — see writeExact (strict on length).
+function createFixedWriter(len, fieldName) {
+    var name = "field '" + fieldName + "' (fixed " + len + ')';
+    return function(val, buf, pos) { return writeExact(val, len, buf, pos, name); };
 }
 
 // ── Map: varint count + (key, value) pairs ───────────────────────────
@@ -863,18 +943,18 @@ function createMapReader(def) {
     var minPair = (def.keyField.fixedSize || 1) + (def.valField.fixedSize || 1);
     return function(buf, pos) {
         var start = pos;
-        var cr = readVarint(buf, pos);
-        pos += cr.bytesRead;
-        if (cr.value * minPair > buf.length - pos) {
-            throw truncErr('litepack: map at byte ' + start + ' needs more bytes (count ' + cr.value + ', ' + (buf.length - pos) + ' remain)');
+        var count = readVarint(buf, pos);
+        pos += _n;
+        if (count * minPair > buf.length - pos) {
+            throw truncErr('litepack: map at byte ' + start + ' needs more bytes (count ' + count + ', ' + (buf.length - pos) + ' remain)');
         }
         var out = {};
-        for (var i = 0; i < cr.value; i++) {
-            var kr = def.keyField.read(buf, pos); pos += kr.bytesRead;
-            var vr = def.valField.read(buf, pos); pos += vr.bytesRead;
-            out[kr.value] = vr.value;
+        for (var i = 0; i < count; i++) {
+            var k = def.keyField.read(buf, pos); pos += _n;
+            var v = def.valField.read(buf, pos); pos += _n;
+            out[k] = v;
         }
-        return { value: out, bytesRead: pos - start };
+        var _v = out; _n = pos - start; return _v;
     };
 }
 
@@ -883,7 +963,7 @@ function createFixedReader(len) {
         if (pos + len > buf.length) {
             throw truncErr('litepack: truncated fixed(' + len + ') at byte ' + pos);
         }
-        return { value: buf.subarray(pos, pos + len), bytesRead: len };
+        var _v = buf.subarray(pos, pos + len); _n = len; return _v;
     };
 }
 
@@ -902,7 +982,7 @@ function createStructReader(compiled) {
         var start = pos;
         var data = {};
         pos = decodeFields(compiled.fields, compiled.optionalCount, buf, pos, data, buf.length);
-        return { value: data, bytesRead: pos - start };
+        var _v = data; _n = pos - start; return _v;
     };
 }
 
@@ -948,7 +1028,7 @@ function compileArrayItem(fd) {
     } else if (itemType === 'fixed' && typeof fd[nextIdx] === 'number') {
         itemField.fixedLen = fd[nextIdx];
         itemField.fixedSize = fd[nextIdx];
-        itemField.write = createFixedWriter(fd[nextIdx]);
+        itemField.write = createFixedWriter(fd[nextIdx], fd[0] + '[]');
         itemField.read = createFixedReader(fd[nextIdx]);
         nextIdx++;
     } else {
@@ -988,20 +1068,18 @@ function createArrayReader(itemField, fixedCount) {
         if (fixedCount !== null) {
             count = fixedCount;
         } else {
-            var cr = readVarint(buf, pos);
-            count = cr.value;
-            pos += cr.bytesRead;
+            count = readVarint(buf, pos);
+            pos += _n;
         }
         if (count * minItemSize > buf.length - pos) {
             throw truncErr('litepack: array at byte ' + start + ' needs more bytes (count ' + count + ', ' + (buf.length - pos) + ' remain)');
         }
         var arr = new Array(count);
         for (var i = 0; i < count; i++) {
-            var r = itemField.read(buf, pos);
-            arr[i] = r.value;
-            pos += r.bytesRead;
+            arr[i] = itemField.read(buf, pos);
+            pos += _n;
         }
-        return { value: arr, bytesRead: pos - start };
+        var _v = arr; _n = pos - start; return _v;
     };
 }
 
@@ -1022,6 +1100,7 @@ function buildBitmask(fields, data) {
 }
 
 function bitmaskHas(bitmask, f) {
+    if (bitmask < 0x80000000) return (bitmask & f.optionalBit) !== 0;   // optionalBit > bitmask → 0
     return Math.floor(bitmask / f.optionalBit) % 2 === 1;
 }
 
@@ -1047,9 +1126,8 @@ function encodeFields(fields, optionalCount, data, buf, pos) {
 function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
     var bitmask = 0;
     if (optionalCount > 0) {
-        var br = readVarint(buf, pos);
-        bitmask = br.value;
-        pos += br.bytesRead;
+        bitmask = readVarint(buf, pos);
+        pos += _n;
     }
 
     for (var i = 0; i < fields.length; i++) {
@@ -1062,15 +1140,15 @@ function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
         if (pos >= bufEnd && !f.isTail) {
             throw truncErr("litepack: truncated input — buffer ended before field '" + f.name + "'");
         }
-        var result = f.isTail ? f.read(buf, pos, bufEnd) : f.read(buf, pos);
-        data[f.name] = result.value;
-        pos += result.bytesRead;
+        var value = f.isTail ? f.read(buf, pos, bufEnd) : f.read(buf, pos);
+        data[f.name] = value;
+        pos += _n;
         if (pos > bufEnd) {
             throw truncErr("litepack: truncated input — field '" + f.name + "' ran past end of buffer");
         }
 
         if (f.variants) {
-            var key = String(result.value);
+            var key = String(value);
             var vd = f.variants[key];
             if (vd) {
                 pos = decodeFields(vd.fields, vd.optionalCount, buf, pos, data, bufEnd);
@@ -1203,12 +1281,17 @@ function compileDef(schema) {
 litepack.encode = function(schema, data) {
     var c = compileDef(schema);
     data = data || {};
-    var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data) + 16);
+    // EXACT size, and return the buffer itself — no .subarray(). In V8 a small
+    // typed array (≤ 64 bytes) lives on the JS heap and is cheap (~40ns), but
+    // .subarray() forces it out to a real ArrayBuffer (~650ns) — that was more
+    // than the whole rest of encode. The estimate is exact for every built-in
+    // type; if a custom codec ever breaks that, the overflow check still throws.
+    var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));
     var pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
     // Typed-array out-of-bounds writes are silently DROPPED — detect them,
     // never return silently corrupted bytes.
     if (pos > buf.length) throw new Error('litepack: encoded size exceeded estimate — custom codec with non-deterministic encode()?');
-    return buf.subarray(0, pos);
+    return pos === buf.length ? buf : buf.subarray(0, pos);
 };
 
 /**
@@ -1254,9 +1337,9 @@ litepack.codec = function(name, codec) {
             return lb + encoded.length;
         },
         read: function(buf, pos) {
-            var l = readVarint(buf, pos);
-            var s = pos + l.bytesRead;
-            return { value: codec.decode(buf.subarray(s, s + l.value)), bytesRead: l.bytesRead + l.value };
+            var len = readVarint(buf, pos), lb = _n;
+            var s = pos + lb;
+            var _v = codec.decode(buf.subarray(s, s + len)); _n = lb + len; return _v;
         },
         estimateSize: function(val) {
             var encoded = codec.encode(val);
@@ -1278,10 +1361,10 @@ litepack.compile = function(schema) {
     return {
         encode: function(data) {
             data = data || {};
-            var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data) + 16);
+            var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));   // exact — see litepack.encode
             var pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
             if (pos > buf.length) throw new Error('litepack: encoded size exceeded estimate — custom codec with non-deterministic encode()?');
-            return buf.subarray(0, pos);
+            return pos === buf.length ? buf : buf.subarray(0, pos);
         },
         decode: function(buf, opts) {
             buf = normalizeBuf(buf, opts);
@@ -1501,7 +1584,7 @@ litepack.codec('json', {
     decode: function(b) { return JSON.parse(utf8Decode(b, 0, b.length)); }
 });
 
-litepack.version = '1.2.0';
+litepack.version = '1.2.2';
 
 return litepack;
 
