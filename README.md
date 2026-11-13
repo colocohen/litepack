@@ -213,12 +213,31 @@ delimiters, no type tags — the schema on both sides is the contract.
 | `struct` | inline | nested object |
 | `array` | count + items | lists, incl. arrays of structs |
 | `ascending` | count + gaps | sorted sets of integers (ids, ranges, indices) |
+| `deltas` | count + steps | integer series (timestamps, counters, coordinates) |
+| `bitset` | count + bits | many booleans, 1 bit each |
 | `map` | count + pairs | dynamic keys, typed values |
 | `json` | len + JSON | free-form escape hatch |
 | *(custom)* | len + codec | anything via `litepack.codec()` |
 
 Any type + `?` = optional (zero bytes when absent). Lengths, counts and
 numbers take `{min, max}` limits (see [Limits](#limits-min--max)).
+
+**How a field is written.** `[name, type, ...what it is made of, {options}]`
+— the positions say what the type consists of (an enum's names, a struct's
+fields, an array's item type, a fixed length); the options object, always
+last, says everything else:
+
+| option | applies to | meaning |
+|---|---|---|
+| `optional: true` | any field | may be absent — same as `type?` |
+| `default: v` | optional fields | value decode gives when absent |
+| `min`, `max` | lengths, counts, numbers | [limits](#limits-min--max) |
+| `chars: 'a-z0-9_'` | `string` | [alphabet](#strings-over-an-alphabet-chars) |
+| `count: N` | `array` | fixed length, no count on the wire |
+| `variants: {...}` | integer, string, bool or enum tag | [tagged union](#variants-tagged-union) |
+
+An unknown option, or an option on a type it does not apply to, is a
+compile error — a typo never passes silently.
 
 ### Integers
 
@@ -282,12 +301,45 @@ field. `bytes` and `tail` take the same inputs; other typed arrays are
 refused (`Int16Array([300])` would otherwise go out as `44`).
 
 Lists of hashes or keys: `['keys', 'array', 'fixed', 32]` (each item exactly
-32 bytes), or with a fixed count `['pair', 'array', 'fixed', 32, 2]`.
+32 bytes), or with a fixed count `['pair', 'array', 'fixed', 32, {count: 2}]`.
 
 > ⚠️ On decode, `bytes` / `fixed` / `tail` return **views** into the input
 > buffer (zero-copy, fast). If you reuse or mutate the network buffer after
 > decoding, copy first: `new Uint8Array(msg.payload)` — or decode with
 > `{copy: true}`.
+
+#### Strings over an alphabet (`chars`)
+
+```js
+['user', 'string', {chars: 'a-z0-9_.', max: 20}]   // 38 characters → 6 bits each
+['mail', 'string', {chars: 'a-z0-9.@_+-'}]
+['word', 'string', {chars: ' א-ת'}]                  // Hebrew: 5 bits, against 16 in UTF-8
+```
+
+Only the listed characters are accepted — on encode and decode — and each
+is stored in the fewest bits that index the alphabet: 5 bits for up to 32
+characters, 6 for up to 64, 7 for up to 128. `a-z` is a range; a `-` first
+or last stands for itself. With `max`/`min`, the limit counts characters.
+
+| value | `string` | `chars` |
+|---|---|---|
+| `aviv_cohen` (`a-z0-9_.`) | 11 B | 9 B |
+| `aviv.cohen+news@example.com` (`a-z0-9.@_+-`) | 28 B | 22 B |
+| `שלום עולם` (` א-ת`) | 18 B | 7 B |
+
+The validation is often worth more than the bytes: a username field that
+cannot carry a character outside its alphabet. Encoding is as fast as a
+plain string; decoding is ~15% slower.
+
+**Not before gzip/brotli.** Packed bits no longer line up with bytes, which
+is what general compressors feed on: 1,000 username+email records are 22%
+smaller packed (29.7 KB vs 38.3 KB), but 42% *larger* after gzip (11.2 KB vs
+7.9 KB) and 28% larger after brotli. Use `chars` for messages sent as they
+are; leave text plain in anything you compress afterwards.
+
+The alphabet is part of the schema (and its `schemaId`): appending a
+character is a wire change, and one that crosses 32, 64 or 128 characters
+changes every character's width.
 
 #### Understanding `tail`
 
@@ -474,7 +526,7 @@ every width (see [SPEC.md](SPEC.md) §5).
 
 ```js
 ['scores', 'array', 'uint16']            // varint count prefix + items
-['rgb',    'array', 'uint8', 3]          // fixed count — no prefix, saves a byte
+['rgb',    'array', 'uint8', {count: 3}] // fixed count — no prefix, saves a byte
 ['tags',   'array', 'string']
 ['roles',  'array', 'enum', ['admin', 'user', 'guest']]
 
@@ -486,7 +538,7 @@ every width (see [SPEC.md](SPEC.md) §5).
 ]]
 
 // Array of structs with fixed count
-['points', 'array', 'struct', [['x','float32'], ['y','float32']], 2]
+['points', 'array', 'struct', [['x','float32'], ['y','float32']], {count: 2}]
 ```
 
 There is **no need** to pre-encode struct entries into an `array` of
@@ -509,6 +561,29 @@ canonical by construction. Good for id sets, sorted indices, and range
 boundaries `[start0, end0, start1, end1, …]` of non-touching ranges.
 Faster than an array of `{gap, len}` structs (≈3× on encode and decode).
 
+### Deltas (integer series)
+
+```js
+['times', 'deltas']   // [1763000000000, 1763000001000, 1763000002000] → 11 bytes (varints: 19)
+```
+
+Integers of any sign, in any order, stored as differences: a count, then
+each value minus the previous one (the first minus 0) as an `svarint`. Values
+that move in small steps — timestamps, counters, positions — cost 1–2 bytes
+each however large they are: 20 timestamps a second apart take 46 bytes,
+against 121 as `varint`s. Each step must stay within ±(2^52−1).
+
+### Bitset (packed booleans)
+
+```js
+['flags', 'bitset']   // 64 booleans → 9 bytes (array of bool: 65)
+```
+
+An array of `true`/`false`, one bit each: a count, then `ceil(count/8)`
+bytes, item *i* in bit *i mod 8* of byte *i / 8* (least significant first).
+Unused bits of the last byte must be zero. For a fixed set of *named* flags,
+`bits` or `set` reads better; `bitset` is for many, unnamed ones.
+
 ### Variants (Tagged Union)
 
 Different fields depending on a discriminator — one schema for a whole
@@ -517,15 +592,25 @@ message family:
 ```js
 var msgProto = [
     ['seq',  'varint'],
-    ['kind', 'uint8', {
+    ['kind', 'uint8', { variants: {
         '1': [['text', 'string']],                                   // chat
         '2': [['width', 'uint16'], ['height', 'uint16'], ['data', 'bytes']],  // image
         '3': [['lat', 'float64'], ['lon', 'float64']]                // location
-    }]
+    }}]
 ];
 
 litepack.encode(msgProto, { seq: 1, kind: 3, lat: 32.08, lon: 34.78 });
 // decode reads `kind`, then parses only the matching branch — flat object out
+```
+
+The tag can be an integer, a string, a bool or an **enum** — then the
+branches are named by its options:
+
+```js
+['op', 'enum', ['put', 'del'], { variants: {
+    put: [['key', 'string'], ['value', 'bytes']],
+    del: [['key', 'string']]
+}}]
 ```
 
 Branch fields land in the same object as the parent's, so a name may appear
@@ -534,7 +619,8 @@ once across a struct and its branches (sibling branches may share one);
 
 ### Optional Fields
 
-Any type takes a `?` suffix. All optional fields in a struct share **one
+Any type takes a `?` suffix — or, the same thing spelled out, the option
+`{optional: true}`. All optional fields in a struct share **one
 varint bitmask** at the front — 8 optionals cost 1 byte of overhead total,
 and each absent field costs nothing:
 
@@ -546,6 +632,10 @@ and each absent field costs nothing:
 
 Up to **52 optional fields** per struct (compile-time error beyond — split
 into nested structs).
+
+```js
+['email', 'string', {optional: true}]    // = ['email', 'string?']
+```
 
 **Default values** — an options object as the last element of the def:
 
@@ -570,6 +660,7 @@ The same options object bounds lengths, counts and numbers:
 ['tags',  'array', 'string', {max: 16}]      // item count
 ['meta',  'map', 'string', 'string', {max: 32}]
 ['ids',   'ascending', {max: 512}]
+['times', 'deltas',  {max: 1000}]
 ['qty',   'varint',  {min: 1, max: 1000}]
 ['temp',  'float32', {min: -50, max: 60}]    // NaN is outside any range
 ['nick',  'string?', {max: 20, default: ''}] // with ? and default
@@ -688,24 +779,44 @@ canonical JSON, UTF-8). For an id from any other hash, hash these:
 crypto.createHash('sha256').update(litepack.schemaBytes(schema)).digest();
 ```
 
-### Sizing & validation
+### Sizing
 
 #### `litepack.byteLength(schema, data)` → `number`
 
 Exact encoded size without encoding — for frame budgets, preallocation,
 and "will this fit in one packet?" checks.
 
-#### `litepack.assertComplete(schema, data)` → `true | throws`
+### Errors
 
-Throws exactly when `encode` would — a missing required field at any depth,
-a wrong type, a value out of range. Since 2.0 `encode` checks all of this
-itself, so this is only for code that wants the check without the bytes:
+Every error litepack throws has a stable `err.code`, and — when it happened
+inside a field — `err.path`; the message carries both for people:
 
 ```js
-litepack.assertComplete(certSignProto, cert);
-// → Error: litepack: missing required field 'publicKey'
-var signBytes = litepack.encode(certSignProto, cert);
+try { litepack.encode(txProto, tx); }
+catch (e) {
+    e.code;     // 'LIMIT'
+    e.path;     // 'signers[1].ranges'
+    e.message;  // "litepack: field 'ranges' — count 600 over max 512 ... (at signers[1].ranges)"
+}
 ```
+
+| code | when |
+|---|---|
+| `SCHEMA` | the schema itself is invalid (compile time) |
+| `TYPE` | encode: a value of the wrong JS type (a `TypeError`) |
+| `RANGE` | a number outside what its type holds |
+| `MISSING` | encode: a required field or bits subfield is absent |
+| `INVALID` | encode: a value the type cannot carry (wrong length, not ascending, const mismatch…) |
+| `UNKNOWN` | an enum/set/variant value or optional bit the schema does not have |
+| `LIMIT` | outside the field's `{min, max}` |
+| `TRUNCATED` | decode: the input ends early (also `err.truncated === true`) |
+| `TRAILING` | decode: bytes after the message |
+| `MALFORMED` | decode: bytes no encoder writes (padding, order, non-minimal, bad UTF-8…) |
+| `CODEC` | a custom codec encoded the same value differently twice |
+| `BUFFER` | `encodeInto`: the target buffer is too small |
+
+Paths look like `order.items[3].sku` for arrays and `meta["lang"]` for map
+values. Tracking them costs nothing until something fails.
 
 ### Streaming & chaining
 
@@ -922,8 +1033,7 @@ var certSignProto = [
     ['subjectId', 'bytes']
 ];
 
-litepack.assertComplete(certSignProto, cert);      // refuse to sign a hole
-var signBytes = litepack.encode(certSignProto, cert);
+var signBytes = litepack.encode(certSignProto, cert);   // throws MISSING on a hole
 var signature = await sign(sha256(signBytes));
 // The verifier rebuilds signBytes from the received cert with the SAME
 // schema — guaranteed identical bytes.
@@ -933,11 +1043,11 @@ var signature = await sign(sha256(signBytes));
 
 ```js
 var wireProto = [
-    ['msgType', 'uint8', {
+    ['msgType', 'uint8', { variants: {
         '1': [['roomId', 'varint'], ['text', 'string']],
         '2': [['roomId', 'varint'], ['imageId', 'varint'], ['thumb', 'bytes']],
         '3': [['peerId', 'varint']]           // typing indicator
-    }]
+    }}]
 ];
 
 var msg = litepack.tryDecode(wireProto, packet);
@@ -1113,11 +1223,19 @@ What changes is what is *accepted*:
 * **`compile` refuses** a field name used twice in a struct and its variant
   branches (1.x encoded both and decoded the second), repeated enum/set
   options or bits subfield names, and the name `__proto__`.
-* **`assertComplete`** now covers nested structures and no longer asks for
-  `const` fields.
-* New: arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
+* **`assertComplete` is removed** — `encode` now throws on everything it
+  checked; call `encode` and drop the bytes if you only want the check.
+* **Errors have `err.code` and `err.path`** (see [Errors](#errors)).
+* **Variants and fixed array counts move into the options object:**
+  `['kind','uint8',{'1':[...]}]` → `['kind','uint8',{variants:{'1':[...]}}]`
+  and `['rgb','array','uint8',3]` → `['rgb','array','uint8',{count:3}]`. The
+  old forms are compile errors that say what to write. Schema ids and wire
+  bytes are unchanged.
+* **Unknown options are errors** (were ignored), and so is a definition on a
+  type that takes none (`['a','varint',5]`).
+* New: `{optional: true}` (same as `?`), enum-tagged variants, arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
   compiled handles, `{extensible}`, `{bigint}`, `schemaId`,
-  `schemaBytes`, the `ascending` type, `{min, max}` limits,
+  `schemaBytes`, the `ascending`, `deltas` and `bitset` types, `{min, max}` limits,
   [SPEC.md](SPEC.md) with test vectors.
 
 ## 🔄 Migrating from 1.0
@@ -1140,7 +1258,7 @@ Behavior changes to be aware of:
   zeros, silently).
 * New types: `svarint`, `int64`, `json`, `const`, `map`, `uuid`,
   `timestamp`. New API: `compile`, `tryDecode`, `byteLength`,
-  `assertComplete`, `reader`, `writer`, `decodeFrom`, `encodeInto`,
+  `reader`, `writer`, `decodeFrom`, `encodeInto`,
   `concat`, `{copy:true}` decode option, `{default:…}` field option,
   `err.truncated` for stream parsing.
 
