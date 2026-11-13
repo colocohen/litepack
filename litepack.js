@@ -5,7 +5,16 @@
  * Schema-defined, varint-prefixed, optional fields via bitmask,
  * bitfield packing, tagged variants, tail bytes.
  *
- * @version 1.0.0
+ * @version 2.0.0
+ *
+ * 2.0 defaults: STRICT both ways. One value has exactly one encoding, and
+ * decode accepts only that encoding (minimal varints, no trailing bytes, no
+ * unknown optional bits / enum indices / set bits / variants, bool 0/1,
+ * canonical NaN, valid UTF-8, sorted map keys). encode throws on any value
+ * that would otherwise be coerced: wrong JS type, non-integer, out of range,
+ * missing required field. Where safety would cost speed, speed is the default
+ * and safety the option ({copy:true}); where it costs nothing, safety is the
+ * default. Schemas that must evolve opt in with {extensible:true}.
  * @license MIT
  */
 (function(root, factory) {
@@ -39,21 +48,32 @@ function truncErr(msg) {
     return e;
 }
 
+// Strict integer coercion for varint values: a safe non-negative integer, as a
+// Number or a BigInt. Everything else throws - 1.x silently wrote 0 for a
+// string or a BigInt, and floored 1.7 to 1.
+function toUint53(val, what) {
+    if (typeof val === 'bigint') {
+        if (val < 0 || val > 9007199254740991) throw new Error('litepack: ' + what + ' value ' + val + ' out of range 0..2^53-1');
+        return Number(val);
+    }
+    if (typeof val !== 'number') throw new TypeError('litepack: ' + what + ' expects a number, got ' + (val === null ? 'null' : typeof val));
+    if (!Number.isInteger(val)) throw new Error('litepack: ' + what + ' value ' + val + ' is not an integer');
+    if (val < 0) throw new Error("litepack: " + what + " cannot encode negative value " + val + " (use 'svarint' for signed)");
+    if (val > 9007199254740991) throw new Error('litepack: ' + what + ' value ' + val + ' exceeds 2^53-1 (use uint64)');
+    return val;
+}
+
 function writeVarint(val, buf, pos) {
     // Fast path: non-negative values below 2^31 (almost every length, id and
     // counter) — plain 32-bit ops instead of Math.floor / % (same bytes).
-    if (typeof val === 'number' && val >= 0 && val < 0x80000000) {
-        val = val | 0;   // == Math.floor for non-negative
+    if (typeof val === 'number' && val >= 0 && val < 0x80000000 && (val | 0) === val) {
         if (val < 0x80) { buf[pos] = val; return 1; }
         var p0 = pos;
         do { buf[pos++] = (val & 0x7F) | 0x80; val >>>= 7; } while (val > 0x7F);
         buf[pos++] = val;
         return pos - p0;
     }
-    if (typeof val !== 'number') val = 0;
-    else if (val < 0) throw new Error("litepack: varint cannot encode negative value " + val + " (use 'svarint' for signed)");
-    else if (val > 9007199254740991) throw new Error('litepack: varint value ' + val + ' exceeds 2^53-1 (use uint64)');
-    val = Math.floor(val);
+    val = toUint53(val, 'varint');
     if (val >= 0x80000000) {
         // 2^31..2^53-1 (e.g. ms timestamps): low 28 bits as 4 groups, then the
         // rest (< 2^25) with 32-bit ops — exact integer math, same bytes.
@@ -78,6 +98,17 @@ function writeVarint(val, buf, pos) {
 // call, before any other read can overwrite it.
 var _n = 0;
 
+// Set by the decode entry points for the duration of one decode: true when the
+// schema evolves ({extensible:true}) - unknown optional bits, enum indices, set
+// bits and variants are then tolerated, and decode() ignores trailing bytes.
+// Saved and restored around every entry point, so a codec that decodes inside
+// a decode cannot leak it.
+var _ext = false;
+// {bigint:true}: uint64/int64 always decode to BigInt. Default: a Number, and a
+// value beyond 2^53 throws (1.x switched to BigInt for those only - one field,
+// two types, depending on the value).
+var _big = false;
+
 function readVarint(buf, pos) {
     var b0 = buf[pos];
     if (b0 < 0x80) { _n = 1; return b0; }   // 1-byte fast path (undefined → slow path → truncErr)
@@ -93,6 +124,9 @@ function readVarint(buf, pos) {
     if (n === MAX_VARINT_BYTES && val > 9007199254740991) {
         throw new Error('litepack: varint at byte ' + (pos - n) + ' exceeds 2^53-1 (would lose precision)');
     }
+    // A last byte of 0 adds nothing: 85 00 means the same as 05. Two byte
+    // strings for one value would give one message two ids/signatures.
+    if (b === 0) throw new Error('litepack: non-minimal varint at byte ' + (pos - n));
     _n = n;
     return val;
 }
@@ -101,7 +135,8 @@ function varintSize(val) {
     if (typeof val === 'number' && val >= 0 && val < 0x80000000) {
         return val < 0x80 ? 1 : val < 0x4000 ? 2 : val < 0x200000 ? 3 : val < 0x10000000 ? 4 : 5;
     }
-    if (typeof val !== 'number' || val < 0) val = 0;
+    if (typeof val === 'bigint') val = Number(val);
+    if (typeof val !== 'number' || val < 0) val = 0;   // invalid: the writer throws
     val = Math.floor(val);
     var n = 1;
     while (val > 0x7F) { n++; val = Math.floor(val / 128); }
@@ -112,12 +147,22 @@ function varintSize(val) {
 // -1→1, 1→2, -2→3, 2→4 ... small magnitudes stay small on the wire.
 
 function zigzag(v)   { return v >= 0 ? v * 2 : -v * 2 - 1; }
+// svarint range: |v| <= 2^52 - 1, so the zigzag value stays an exact double
+function toInt53(v) {
+    if (typeof v === 'bigint') v = Number(v);   /* range-checked below */
+    if (typeof v !== 'number') throw new TypeError('litepack: svarint expects a number, got ' + (v === null ? 'null' : typeof v));
+    if (!Number.isInteger(v)) throw new Error('litepack: svarint value ' + v + ' is not an integer');
+    if (v > 4503599627370495 || v < -4503599627370495) throw new Error('litepack: svarint value ' + v + ' out of range ±(2^52-1)');
+    return v;
+}
 function unzigzag(v) { return (v % 2 === 0) ? v / 2 : -(v + 1) / 2; }
 
 // ── UTF-8 ───────────────────────────────────────────────────
 
 var _enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
-var _dec = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+// fatal: invalid UTF-8 throws instead of becoming U+FFFD (two byte strings,
+// one text). ignoreBOM: a leading U+FEFF is text, not something to drop.
+var _dec = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }) : null;
 
 function utf8Encode(str) {
     if (_enc) return _enc.encode(str);
@@ -160,6 +205,13 @@ function utf8ByteLength(str) {
 }
 
 function utf8Decode(buf, offset, length) {
+    // Short ASCII (ids, names, keys): built directly - always valid UTF-8, and
+    // faster than a TextDecoder call for a handful of bytes
+    if (length <= 32) {
+        var str = '', i = offset, end = offset + length;
+        for (; i < end; i++) { var ch = buf[i]; if (ch >= 0x80) break; str += String.fromCharCode(ch); }
+        if (i === end) return str;
+    }
     if (_dec) return _dec.decode(buf.subarray(offset, offset + length));
     var str = '', end = offset + length, i = offset;
     while (i < end) {
@@ -199,11 +251,13 @@ var TYPES = {};
 // throws instead of being silently masked (300 as uint8 used to go out as 44 —
 // for a message-type field, that is a DIFFERENT message). Non-numbers stay
 // lenient (undefined → 0, true → 1), as before.
-function checkUint(v, max, name) {
-    if (typeof v === 'number' && (v < 0 || v > max)) {
-        throw new Error('litepack: ' + name + ' value ' + v + ' out of range 0..' + max);
+function checkInt(v, min, max, name) {
+    if (typeof v !== 'number') throw new TypeError('litepack: ' + name + ' expects a number, got ' + (v === null ? 'null' : typeof v));
+    if (!Number.isInteger(v) || v < min || v > max) {
+        throw new Error('litepack: ' + name + ' value ' + v + ' out of range ' + min + '..' + max + ' (integers only)');
     }
 }
+function checkUint(v, max, name) { checkInt(v, 0, max, name); }
 
 TYPES.uint8 = {
     size: 1,
@@ -213,7 +267,7 @@ TYPES.uint8 = {
 
 TYPES.int8 = {
     size: 1,
-    write: function(v, buf, pos) { buf[pos] = v & 0xFF; return 1; },
+    write: function(v, buf, pos) { checkInt(v, -128, 127, 'int8'); buf[pos] = v & 0xFF; return 1; },
     read:  function(buf, pos) { var x = buf[pos]; var _v = x > 127 ? x - 256 : x; _n = 1; return _v; }
 };
 
@@ -233,6 +287,7 @@ TYPES.uint16 = {
 TYPES.int16 = {
     size: 2,
     write: function(v, buf, pos) {
+        checkInt(v, -32768, 32767, 'int16');
         buf[pos] = (v >> 8) & 0xFF;
         buf[pos + 1] = v & 0xFF;
         return 2;
@@ -261,6 +316,7 @@ TYPES.uint32 = {
 TYPES.int32 = {
     size: 4,
     write: function(v, buf, pos) {
+        checkInt(v, -2147483648, 2147483647, 'int32');
         buf[pos]     = (v >> 24) & 0xFF;
         buf[pos + 1] = (v >> 16) & 0xFF;
         buf[pos + 2] = (v >> 8) & 0xFF;
@@ -272,9 +328,24 @@ TYPES.int32 = {
     }
 };
 
+var TWO64 = typeof BigInt !== 'undefined' ? BigInt('18446744073709551616') : 0;
+function check64(v, signed, name) {
+    if (typeof v === 'bigint') {
+        var lo = signed ? -(TWO64 >> BigInt(1)) : BigInt(0), hi = signed ? (TWO64 >> BigInt(1)) - BigInt(1) : TWO64 - BigInt(1);
+        if (v < lo || v > hi) throw new Error('litepack: ' + name + ' value ' + v + ' out of range');
+        return;
+    }
+    if (typeof v !== 'number') throw new TypeError('litepack: ' + name + ' expects a number or BigInt, got ' + (v === null ? 'null' : typeof v));
+    // Numbers beyond 2^53 are already rounded: refuse rather than write a
+    // neighbouring value. Pass a BigInt for those.
+    if (!Number.isSafeInteger(v)) throw new Error('litepack: ' + name + ' value ' + v + ' is not a safe integer (use a BigInt above 2^53)');
+    if (!signed && v < 0) throw new Error('litepack: ' + name + ' value ' + v + ' is negative');
+}
+
 TYPES.uint64 = {
     size: 8,
     write: function(v, buf, pos) {
+        check64(v, false, 'uint64');
         var hi, lo;
         if (typeof v === 'bigint') {
             hi = Number(v >> BigInt(32)) >>> 0;
@@ -296,24 +367,24 @@ TYPES.uint64 = {
     read: function(buf, pos) {
         var hi = ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0;
         var lo = ((buf[pos + 4] << 24) | (buf[pos + 5] << 16) | (buf[pos + 6] << 8) | buf[pos + 7]) >>> 0;
+        _n = 8;
+        if (_big) return (BigInt(hi) << BigInt(32)) | BigInt(lo);
         var v = hi * 0x100000000 + lo;
-        if (v > 9007199254740991 && typeof BigInt !== 'undefined') {
-            v = (BigInt(hi) << BigInt(32)) | BigInt(lo);
-        }
-        var _v = v; _n = 8; return _v;
+        if (v > 9007199254740991) throw new Error('litepack: uint64 at byte ' + pos + ' exceeds 2^53 (decode with {bigint:true})');
+        return v;
     }
 };
 
 TYPES.int64 = {
     size: 8,
     write: function(v, buf, pos) {
+        check64(v, true, 'int64');
         var hi, lo;
         if (typeof v === 'bigint') {
             var u = BigInt.asUintN(64, v);   // two's complement
             hi = Number(u >> BigInt(32)) >>> 0;
             lo = Number(u & BigInt(0xFFFFFFFF)) >>> 0;
         } else {
-            v = v || 0;
             lo = ((v % 0x100000000) + 0x100000000) % 0x100000000;
             hi = Math.floor(v / 0x100000000);
             if (hi < 0) hi += 0x100000000;
@@ -323,20 +394,17 @@ TYPES.int64 = {
     read: function(buf, pos) {
         var hi = ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0;
         var lo = ((buf[pos + 4] << 24) | (buf[pos + 5] << 16) | (buf[pos + 6] << 8) | buf[pos + 7]) >>> 0;
+        _n = 8;
+        if (_big) return BigInt.asIntN(64, (BigInt(hi) << BigInt(32)) | BigInt(lo));
         var v;
         if (hi & 0x80000000) {
             // negative — compute exactly from components (no 2^64 double rounding)
             v = -((0xFFFFFFFF - hi) * 0x100000000 + (0x100000000 - lo));
-            if (v < -9007199254740991 && typeof BigInt !== 'undefined') {
-                v = BigInt.asIntN(64, (BigInt(hi) << BigInt(32)) | BigInt(lo));
-            }
         } else {
             v = hi * 0x100000000 + lo;
-            if (v > 9007199254740991 && typeof BigInt !== 'undefined') {
-                v = (BigInt(hi) << BigInt(32)) | BigInt(lo);
-            }
         }
-        var _v = v; _n = 8; return _v;
+        if (v > 9007199254740991 || v < -9007199254740991) throw new Error('litepack: int64 at byte ' + pos + ' beyond ±2^53 (decode with {bigint:true})');
+        return v;
     }
 };
 
@@ -353,37 +421,59 @@ function writeI64(hi, lo, buf, pos) {
 }
 
 // Floats
+function checkFloat(v, name) {
+    if (typeof v !== 'number') throw new TypeError('litepack: ' + name + ' expects a number, got ' + (v === null ? 'null' : typeof v));
+}
 TYPES.float32 = {
     size: 4,
     write: function(v, buf, pos) {
+        checkFloat(v, 'float32');
         _dv.setFloat32(0, v, false);
         buf[pos] = _u8[0]; buf[pos + 1] = _u8[1]; buf[pos + 2] = _u8[2]; buf[pos + 3] = _u8[3];
         return 4;
     },
     read: function(buf, pos) {
         _u8[0] = buf[pos]; _u8[1] = buf[pos + 1]; _u8[2] = buf[pos + 2]; _u8[3] = buf[pos + 3];
-        var _v = _dv.getFloat32(0, false); _n = 4; return _v;
+        var _v = _dv.getFloat32(0, false);
+        // NaN has 2^24 bit patterns; encode always writes 7FC00000
+        if (_v !== _v && (buf[pos] !== 0x7F || buf[pos + 1] !== 0xC0 || buf[pos + 2] !== 0 || buf[pos + 3] !== 0)) {
+            throw new Error('litepack: non-canonical NaN at byte ' + pos);
+        }
+        _n = 4; return _v;
     }
 };
 
 TYPES.float64 = {
     size: 8,
     write: function(v, buf, pos) {
+        checkFloat(v, 'float64');
         _dv.setFloat64(0, v, false);
         for (var i = 0; i < 8; i++) buf[pos + i] = _u8[i];
         return 8;
     },
     read: function(buf, pos) {
         for (var i = 0; i < 8; i++) _u8[i] = buf[pos + i];
-        var _v = _dv.getFloat64(0, false); _n = 8; return _v;
+        var _v = _dv.getFloat64(0, false);
+        if (_v !== _v) {   // one NaN encoding: 7FF8000000000000
+            if (buf[pos] !== 0x7F || buf[pos + 1] !== 0xF8) throw new Error('litepack: non-canonical NaN at byte ' + pos);
+            for (var j = 2; j < 8; j++) if (buf[pos + j] !== 0) throw new Error('litepack: non-canonical NaN at byte ' + pos);
+        }
+        _n = 8; return _v;
     }
 };
 
 // Bool
 TYPES.bool = {
     size: 1,
-    write: function(v, buf, pos) { buf[pos] = v ? 1 : 0; return 1; },
-    read:  function(buf, pos) { var _v = buf[pos] !== 0; _n = 1; return _v; }
+    write: function(v, buf, pos) {
+        if (v !== true && v !== false) throw new TypeError('litepack: bool expects true or false, got ' + (v === null ? 'null' : typeof v));
+        buf[pos] = v ? 1 : 0; return 1;
+    },
+    read:  function(buf, pos) {
+        var x = buf[pos];
+        if (x > 1) throw new Error('litepack: bool byte ' + x + ' at ' + pos + ' (only 0 or 1)');
+        _n = 1; return x === 1;
+    }
 };
 
 // Varint
@@ -402,19 +492,34 @@ TYPES.varint = {
 // Missing (undefined/null) stays lenient — N zero bytes — as every other
 // missing scalar encodes as its zero value (assertComplete forbids that).
 function writeExact(v, len, buf, pos, name) {
-    if (v === undefined || v === null) {
-        for (var i = 0; i < len; i++) buf[pos + i] = 0;
-        return len;
-    }
-    if (!ArrayBuffer.isView(v) && !Array.isArray(v)) {
+    if (v instanceof ArrayBuffer) v = new Uint8Array(v);
+    if (!(v instanceof Uint8Array) && !Array.isArray(v)) {
         throw new Error('litepack: ' + name + ' expects ' + len + ' bytes (Uint8Array), got ' + typeof v +
                         (typeof v === 'string' ? ' — decode hex/base64 to bytes first' : ''));
     }
     if (v.length !== len) {
         throw new Error('litepack: ' + name + ' expects exactly ' + len + ' bytes, got ' + v.length);
     }
+    if (Array.isArray(v)) checkByteArray(v, name);
     buf.set(v, pos);
     return len;
+}
+
+// A plain array given as bytes: every item an integer 0..255 (buf.set would
+// silently take 256 as 0 and 1.5 as 1).
+function checkByteArray(a, name) {
+    for (var i = 0; i < a.length; i++) {
+        var x = a[i];
+        if (typeof x !== 'number' || x < 0 || x > 255 || (x | 0) !== x) throw new Error('litepack: ' + name + ' byte ' + i + ' is ' + x + ' (0..255 integers only)');
+    }
+}
+// bytes / tail input: a Uint8Array (Buffer is one), an ArrayBuffer, or a byte
+// array. Other typed arrays are refused - Int16Array([300]) would go out as 44.
+function asBytes(v, name) {
+    if (v instanceof Uint8Array) return v;
+    if (v instanceof ArrayBuffer) return new Uint8Array(v);
+    if (Array.isArray(v)) { checkByteArray(v, name); return v; }
+    throw new TypeError('litepack: ' + name + ' expects a Uint8Array, got ' + (v === null ? 'null' : ArrayBuffer.isView(v) ? v.constructor.name : typeof v));
 }
 
 // UUID / 16-byte ids — exactly 16 bytes, no length prefix
@@ -431,8 +536,7 @@ TYPES.uuid = {
 TYPES.svarint = {
     size: null,
     write: function(v, buf, pos) {
-        if (typeof v !== 'number') v = 0;
-        return writeVarint(zigzag(Math.round(v)), buf, pos);
+        return writeVarint(zigzag(toInt53(v)), buf, pos);
     },
     read: function(buf, pos) {
         return unzigzag(readVarint(buf, pos));   // _n already set by readVarint
@@ -445,7 +549,8 @@ var _hasEncodeInto = _enc && typeof _enc.encodeInto === 'function';
 TYPES.string = {
     size: null,
     write: function(v, buf, pos) {
-        var s = v == null ? '' : String(v);
+        if (typeof v !== 'string') throw new TypeError('litepack: string expects a string, got ' + (v === null ? 'null' : typeof v));
+        var s = v;
         // ASCII fast path: copy char codes straight into buf. The old path's
         // buf.subarray() for encodeInto forces a small (on-heap) output
         // buffer out to a real ArrayBuffer — slower than the rest of encode.
@@ -460,6 +565,11 @@ TYPES.string = {
                 buf[q + i] = c;
             }
             if (i === sl) { buf[pos] = sl; return sl + 1; }
+        }
+        // a lone surrogate cannot be UTF-8: encodeInto would write U+FFFD and
+        // the text would come back different
+        if (typeof s.isWellFormed === 'function' ? !s.isWellFormed() : /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/.test(s)) {
+            throw new Error('litepack: string has a lone surrogate (not valid Unicode)');
         }
         var len = utf8ByteLength(s);
         var lb = writeVarint(len, buf, pos);
@@ -476,7 +586,10 @@ TYPES.string = {
         if (pos + lb + len > buf.length) {
             throw truncErr('litepack: truncated string at byte ' + pos + ' (declared ' + len + ' bytes, ' + (buf.length - pos - lb) + ' remain)');
         }
-        var _v = utf8Decode(buf, pos + lb, len); _n = lb + len; return _v;
+        var _v;
+        try { _v = utf8Decode(buf, pos + lb, len); }
+        catch (e) { throw new Error('litepack: invalid UTF-8 in string at byte ' + pos); }
+        _n = lb + len; return _v;
     }
 };
 
@@ -484,7 +597,7 @@ TYPES.string = {
 TYPES.bytes = {
     size: null,
     write: function(v, buf, pos) {
-        var d = v || new Uint8Array(0);
+        var d = asBytes(v, 'bytes');
         var lb = writeVarint(d.length, buf, pos);
         buf.set(d, pos + lb);
         return lb + d.length;
@@ -506,7 +619,7 @@ TYPES.tail = {
     size: null,
     isTail: true,
     write: function(v, buf, pos) {
-        var d = v || new Uint8Array(0);
+        var d = asBytes(v, 'tail');
         buf.set(d, pos);
         return d.length;
     },
@@ -529,6 +642,8 @@ TYPES.array = { size: null };
 // so 52 flag bits are safe. Past that we throw at COMPILE time — loudly,
 // instead of corrupting data at runtime like a 32-bit shift would.
 var MAX_OPTIONAL_FIELDS = 52;
+var POW2 = [];
+for (var _p = 0; _p <= 53; _p++) POW2.push(Math.pow(2, _p));
 
 // Compound types that REQUIRE a third schema element — catch at compile with
 // a real message instead of "f.write is not a function" at encode time.
@@ -677,11 +792,17 @@ function compileFields(fieldDefs, nested) {
                 throw new Error("litepack: field '" + fname + "' — const base type '" + fd[2] + "' is not a simple type");
             }
             f.constValue = cVal;
+            f.isConst = true;
             f.constBaseType = fd[2];
             f.fixedSize = cBase.size;
-            f.write = (function(base, cv) {
-                return function(val, buf, pos) { return base.write(cv, buf, pos); };
-            })(cBase, cVal);
+            f.write = (function(base, cv, nm) {
+                return function(val, buf, pos) {
+                    if (val !== undefined && val !== null && val !== cv) {
+                        throw new Error("litepack: field '" + nm + "' is const " + JSON.stringify(cv) + ', data says ' + JSON.stringify(val));
+                    }
+                    return base.write(cv, buf, pos);
+                };
+            })(cBase, cVal, fname);
             f.read = (function(base, cv, nm) {
                 return function(buf, pos) {
                     var v = base.read(buf, pos);   // _n set by base.read
@@ -754,7 +875,7 @@ function compileBits(bitsDef) {
         if (typeof w !== 'number' || w < 1 || w > 32) {
             throw new Error("litepack: bits field '" + bitsDef[i][0] + "' has invalid width " + w + ' (must be 1-32)');
         }
-        subFields.push({ name: bitsDef[i][0], width: w });
+        subFields.push({ name: bitsDef[i][0], width: w, limit: Math.pow(2, w) });
         totalBits += w;
     }
     return { subFields: subFields, totalBits: totalBits, totalBytes: Math.ceil(totalBits / 8) };
@@ -762,13 +883,26 @@ function compileBits(bitsDef) {
 
 // Fast path (totalBits ≤ 31): everything fits one JS bitwise int — the original
 // shift/mask code. General path: bit-by-bit across bytes, no 32-bit ceiling.
+function checkBits(def, val) {
+    if (!val || typeof val !== 'object') throw new TypeError('litepack: bits expects an object of subfields');
+    for (var i = 0; i < def.subFields.length; i++) {
+        var sf = def.subFields[i], v = val[sf.name];
+        if (v === undefined || v === null) throw new Error("litepack: bits subfield '" + sf.name + "' is missing");
+        if (typeof v === 'boolean') v = v ? 1 : 0;
+        if (typeof v !== 'number' || v < 0 || v >= sf.limit || (v % 1) !== 0) {
+            throw new Error("litepack: bits subfield '" + sf.name + "' value " + v + ' does not fit ' + sf.width + ' bit(s)');
+        }
+    }
+}
+function bitVal(v) { return v === true ? 1 : v === false ? 0 : v; }
+
 function createBitsWriter(def) {
     if (def.totalBits <= 31) return function(val, buf, pos) {
+        checkBits(def, val);
         var packed = 0;
         for (var i = 0; i < def.subFields.length; i++) {
             var sf = def.subFields[i];
-            var v = (val && val[sf.name]) || 0;
-            packed = (packed << sf.width) | (v & ((1 << sf.width) - 1));
+            packed = (packed << sf.width) | bitVal(val[sf.name]);
         }
         for (var b = def.totalBytes - 1; b >= 0; b--) {
             buf[pos + b] = packed & 0xFF;
@@ -777,11 +911,12 @@ function createBitsWriter(def) {
         return def.totalBytes;
     };
     return function(val, buf, pos) {
+        checkBits(def, val);
         for (var b = 0; b < def.totalBytes; b++) buf[pos + b] = 0;
         var bitPos = 0;
         for (var i = 0; i < def.subFields.length; i++) {
             var sf = def.subFields[i];
-            var v = ((val && val[sf.name]) || 0) >>> 0;
+            var v = bitVal(val[sf.name]) >>> 0;
             for (var w = sf.width - 1; w >= 0; w--) {
                 if ((w < 31 ? (v >>> w) : Math.floor(v / 0x80000000)) & 1) {
                     buf[pos + (bitPos >> 3)] |= 0x80 >> (bitPos & 7);
@@ -794,9 +929,11 @@ function createBitsWriter(def) {
 }
 
 function createBitsReader(def) {
+    var pad = def.totalBytes * 8 - def.totalBits;   // unused high bits: must be 0
     if (def.totalBits <= 31) return function(buf, pos) {
         var packed = 0;
         for (var b = 0; b < def.totalBytes; b++) packed = (packed << 8) | buf[pos + b];
+        if (pad && (buf[pos] >> (8 - pad))) throw new Error('litepack: bits padding not zero at byte ' + pos);
         var result = {};
         var remaining = def.totalBits;
         for (var i = 0; i < def.subFields.length; i++) {
@@ -807,6 +944,7 @@ function createBitsReader(def) {
         var _v = result; _n = def.totalBytes; return _v;
     };
     return function(buf, pos) {
+        if (pad && (buf[pos + def.totalBytes - 1] & ((1 << pad) - 1))) throw new Error('litepack: bits padding not zero at byte ' + pos);
         var result = {};
         var bitPos = 0;
         for (var i = 0; i < def.subFields.length; i++) {
@@ -838,8 +976,7 @@ function createEnumWriter(opts, fieldName) {
         if (idx === -1) {
             // Silently encoding index 0 would turn a typo into a DIFFERENT valid value.
             // Numeric passthrough is allowed for forward-compat (value from a newer peer).
-            if (typeof val === 'number' && val >= 0) return writeVarint(val, buf, pos);
-            if (val === undefined || val === null) return writeVarint(0, buf, pos);
+            if (typeof val === 'number' && val >= 0 && Number.isInteger(val)) return writeVarint(val, buf, pos);
             throw new Error("litepack: field '" + fieldName + "' — unknown enum value " + JSON.stringify(val) + ' (options: ' + opts.join(', ') + ')');
         }
         return writeVarint(idx, buf, pos);
@@ -849,7 +986,9 @@ function createEnumWriter(opts, fieldName) {
 function createEnumReader(opts) {
     return function(buf, pos) {
         var v = readVarint(buf, pos);   // _n set by readVarint
-        return v < opts.length ? opts[v] : v;
+        if (v < opts.length) return opts[v];
+        if (!_ext) throw new Error('litepack: enum index ' + v + ' at byte ' + pos + ' is not one of ' + opts.length + ' options');
+        return v;
     };
 }
 
@@ -863,7 +1002,8 @@ function createSetWriter(opts, fieldName) {
     var idxMap = buildIndexMap(opts);
     return function(val, buf, pos) {
         var mask = 0;
-        if (val) {
+        if (!Array.isArray(val)) throw new TypeError("litepack: field '" + fieldName + "' — set expects an array");
+        {
             for (var i = 0; i < val.length; i++) {
                 var idx = idxMap[val[i]] !== undefined ? idxMap[val[i]] : -1;
                 if (idx === -1) {
@@ -878,8 +1018,10 @@ function createSetWriter(opts, fieldName) {
 }
 
 function createSetReader(opts) {
+    var limit = Math.pow(2, opts.length);
     return function(buf, pos) {
         var mask = readVarint(buf, pos), lb = _n;
+        if (mask >= limit && !_ext) throw new Error('litepack: set at byte ' + pos + ' has bits beyond its ' + opts.length + ' options');
         var arr = [];
         for (var i = 0; i < opts.length && mask > 0; i++) {
             if (mask % 2 === 1) arr.push(opts[i]);
@@ -925,9 +1067,37 @@ function makeSimpleField(typeName, ctx) {
     return { type: typeName, fixedSize: t.size, write: t.write, read: t.read };
 }
 
+// Canonical key order: numbers ascending; strings by Unicode code point (the
+// same order as their UTF-8 bytes, so any language can reproduce it). JS '<'
+// compares UTF-16 units, which differs only above U+FFFF.
+function cmpKeys(a, b, numeric) {
+    if (numeric) return a - b;
+    var n = Math.min(a.length, b.length);
+    for (var i = 0; i < n; i++) {
+        var x = a.charCodeAt(i), y = b.charCodeAt(i);
+        if (x === y) continue;
+        if (x >= 0xD800 && x <= 0xDFFF || y >= 0xD800 && y <= 0xDFFF) {
+            var cx = a.codePointAt(i), cy = b.codePointAt(i);
+            return cx - cy;
+        }
+        return x - y;
+    }
+    return a.length - b.length;
+}
 function createMapWriter(def, fieldName) {
     return function(val, buf, pos) {
-        var keys = val ? Object.keys(val) : [];
+        if (!val || typeof val !== 'object' || Array.isArray(val)) throw new TypeError("litepack: field '" + fieldName + "' — map expects a plain object");
+        var keys = Object.keys(val);
+        var num = def.numericKeys, sorted = true;
+        for (var q = 1; q < keys.length; q++) {
+            if (cmpKeys(num ? Number(keys[q - 1]) : keys[q - 1], num ? Number(keys[q]) : keys[q], num) > 0) { sorted = false; break; }
+        }
+        if (!sorted) {
+            keys = keys.slice();
+            if (num) keys.sort(function(x, y) { return Number(x) - Number(y); });
+            else keys.sort(function(x, y) { return cmpKeys(x, y, false); });
+        }
+        if (num) for (q = 1; q < keys.length; q++) if (Number(keys[q - 1]) === Number(keys[q])) throw new Error("litepack: field '" + fieldName + "' — map keys '" + keys[q - 1] + "' and '" + keys[q] + "' are the same number");
         var start = pos;
         pos += writeVarint(keys.length, buf, pos);
         for (var i = 0; i < keys.length; i++) {
@@ -948,9 +1118,13 @@ function createMapReader(def) {
         if (count * minPair > buf.length - pos) {
             throw truncErr('litepack: map at byte ' + start + ' needs more bytes (count ' + count + ', ' + (buf.length - pos) + ' remain)');
         }
-        var out = {};
+        var out = {}, prev, num = def.numericKeys;
         for (var i = 0; i < count; i++) {
+            var at = pos;
             var k = def.keyField.read(buf, pos); pos += _n;
+            // strictly increasing: sorted, and no key twice (1.x let the last win)
+            if (i > 0 && cmpKeys(prev, k, num) >= 0) throw new Error('litepack: map keys out of order or repeated at byte ' + at);
+            prev = k;
             var v = def.valField.read(buf, pos); pos += _n;
             out[k] = v;
         }
@@ -971,8 +1145,9 @@ function createFixedReader(len) {
 
 function createStructWriter(compiled) {
     return function(val, buf, pos) {
+        if (!val || typeof val !== 'object') throw new TypeError('litepack: struct expects an object, got ' + (val === null ? 'null' : typeof val));
         var start = pos;
-        pos = encodeFields(compiled.fields, compiled.optionalCount, val || {}, buf, pos);
+        pos = encodeFields(compiled.fields, compiled.optionalCount, val, buf, pos);
         return pos - start;
     };
 }
@@ -988,7 +1163,7 @@ function createStructReader(compiled) {
 
 // ── Array compiler ──────────────────────────────────────────
 
-var UNSUPPORTED_ARRAY_ITEM = { array: 1, map: 1, bits: 1, fixed: 1, tail: 1, 'const': 1 };
+var UNSUPPORTED_ARRAY_ITEM = { array: 1, map: 1, bits: 1, tail: 1, 'const': 1 };   // 'fixed' works: ['hashes','array','fixed',32]
 
 function compileArrayItem(fd) {
     // fd = ['name', 'array', itemType, itemDef?, fixedCount?]
@@ -1025,7 +1200,8 @@ function compileArrayItem(fd) {
         itemField.write = createBitsWriter(def);
         itemField.read = createBitsReader(def);
         nextIdx++;
-    } else if (itemType === 'fixed' && typeof fd[nextIdx] === 'number') {
+    } else if (itemType === 'fixed') {
+        if (typeof fd[nextIdx] !== 'number') throw new Error("litepack: field '" + fd[0] + "' — array of fixed needs the item length: ['" + fd[0] + "', 'array', 'fixed', 32]");
         itemField.fixedLen = fd[nextIdx];
         itemField.fixedSize = fd[nextIdx];
         itemField.write = createFixedWriter(fd[nextIdx], fd[0] + '[]');
@@ -1045,7 +1221,9 @@ function compileArrayItem(fd) {
 
 function createArrayWriter(itemField, fixedCount) {
     return function(val, buf, pos) {
-        var a = val || [];
+        if (!Array.isArray(val)) throw new TypeError('litepack: array expects an array, got ' + (val === null ? 'null' : typeof val));
+        var a = val;
+        if (fixedCount !== null && a.length !== fixedCount) throw new Error('litepack: array has ' + a.length + ' items, the schema fixes ' + fixedCount);
         var start = pos;
         if (fixedCount === null) pos += writeVarint(a.length, buf, pos);
         var count = fixedCount !== null ? fixedCount : a.length;
@@ -1109,15 +1287,18 @@ function encodeFields(fields, optionalCount, data, buf, pos) {
 
     for (var i = 0; i < fields.length; i++) {
         var f = fields[i];
-        if (f.optional) {
-            var val = data[f.name];
-            if (val === undefined || val === null) continue;
+        var val = data[f.name];
+        if (val === undefined || val === null) {
+            if (f.optional) continue;
+            // 1.x wrote a zero value here; a missing field is a bug, and in
+            // signed bytes it would sign a hole
+            if (!f.isConst) throw new Error("litepack: missing required field '" + f.name + "'");
         }
-        pos += f.write(data[f.name], buf, pos);
+        pos += f.write(val, buf, pos);
         if (f.variants) {
-            var key = String(data[f.name]);
-            var vd = f.variants[key];
-            if (vd) pos = encodeFields(vd.fields, vd.optionalCount, data, buf, pos);
+            var vd = f.variants[String(val)];
+            if (!vd) throw new Error("litepack: field '" + f.name + "' — no variant for value " + JSON.stringify(val) + ' (known: ' + Object.keys(f.variants).join(', ') + ')');
+            pos = encodeFields(vd.fields, vd.optionalCount, data, buf, pos);
         }
     }
     return pos;
@@ -1126,8 +1307,12 @@ function encodeFields(fields, optionalCount, data, buf, pos) {
 function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
     var bitmask = 0;
     if (optionalCount > 0) {
+        var at = pos;
         bitmask = readVarint(buf, pos);
         pos += _n;
+        // a bit for a field this schema does not have: a newer peer's field
+        // (fine if extensible), otherwise a second encoding of the same data
+        if (bitmask >= POW2[optionalCount] && !_ext) throw new Error('litepack: optional bitmask at byte ' + at + ' sets bits beyond the ' + optionalCount + ' optional fields');
     }
 
     for (var i = 0; i < fields.length; i++) {
@@ -1152,8 +1337,10 @@ function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
             var vd = f.variants[key];
             if (vd) {
                 pos = decodeFields(vd.fields, vd.optionalCount, buf, pos, data, bufEnd);
-            } else {
+            } else if (_ext) {
                 data._unknownVariant = true;
+            } else {
+                throw new Error("litepack: field '" + f.name + "' — no variant for value " + JSON.stringify(value));
             }
         }
     }
@@ -1164,7 +1351,7 @@ function decodeFields(fields, optionalCount, buf, pos, data, bufEnd) {
 
 function estimateSingleField(f, val) {
     if (f.fixedSize) return f.fixedSize;
-    if (f.isTail) return (val && val.length) || 0;
+    if (f.isTail) return val instanceof ArrayBuffer ? val.byteLength : (val && val.length) || 0;
 
     switch (f.type) {
         case 'string':
@@ -1172,7 +1359,7 @@ function estimateSingleField(f, val) {
             var slen = utf8ByteLength(val == null ? '' : String(val));
             return varintSize(slen) + slen;
         case 'bytes':
-            var len = (val && val.length) || 0;
+            var len = val instanceof ArrayBuffer ? val.byteLength : (val && val.length) || 0;
             return varintSize(len) + len;
         case 'varint':
             return varintSize(val || 0);
@@ -1310,12 +1497,40 @@ function normalizeBuf(buf, opts) {
     return buf;
 }
 
+// One decode of a whole buffer. Strict unless the schema (compile) or the call
+// says {extensible:true}: then trailing bytes - fields a newer peer appended -
+// are ignored, as are unknown optional bits, enum indices, set bits, variants.
+// No try/finally (it showed in small-message decode times): every entry point
+// sets _ext itself, and restores it on the normal path for a codec that
+// decodes inside a decode. After a throw the next entry point sets it anew.
+// The optional bitmask sits at the START of a struct. A schema with no optional
+// field has none, so adding its first optional field later inserts a byte in
+// front of everything and an old reader misreads every field (1.x did, silently
+// - its own README example did). An evolving schema must carry an optional
+// field from its first version.
+function checkExtensible(c) {
+    if (c.optionalCount === 0) {
+        throw new Error('litepack: {extensible:true} needs a schema with at least one optional field from its first version - ' +
+                        'the optional bitmask is at the start, so adding the first optional field later would shift every field (reserve one, e.g. [\'ext\', \'varint?\'])');
+    }
+}
+
+function decodeAll(c, buf, ext, big) {
+    if (ext) checkExtensible(c);
+    var prev = _ext, prevBig = _big;
+    _ext = ext; _big = big;
+    var data = {};
+    var end = decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
+    _ext = prev; _big = prevBig;
+    if (end !== buf.length && !ext) {
+        throw new Error('litepack: ' + (buf.length - end) + ' trailing byte(s) after the message (decode with {extensible:true} to allow fields from newer peers)');
+    }
+    return data;
+}
+
 litepack.decode = function(schema, buf, opts) {
     buf = normalizeBuf(buf, opts);
-    var c = compileDef(schema);
-    var data = {};
-    decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
-    return data;
+    return decodeAll(compileDef(schema), buf, !!(opts && opts.extensible), !!(opts && opts.bigint));
 };
 
 /**
@@ -1324,10 +1539,13 @@ litepack.decode = function(schema, buf, opts) {
  * @param {string} name - Type name to use in schemas
  * @param {object} codec - { encode: fn(value) → Uint8Array, decode: fn(Uint8Array) → value }
  */
+var BUILTIN = null;   // filled once the built-ins (json included) exist
 litepack.codec = function(name, codec) {
     if (!codec || typeof codec.encode !== 'function' || typeof codec.decode !== 'function') {
         throw new Error("litepack.codec: requires { encode, decode }");
     }
+    // 1.x let codec('string', ...) replace the string type for every schema
+    if (BUILTIN && BUILTIN[name]) throw new Error("litepack.codec: '" + name + "' is a built-in type and cannot be replaced");
     TYPES[name] = _codecs[name] = {
         size: null,
         write: function(val, buf, pos) {
@@ -1356,8 +1574,10 @@ litepack.codec = function(name, codec) {
  *   var buf  = Cert.encode(data);
  *   var obj  = Cert.decode(buf);
  */
-litepack.compile = function(schema) {
+litepack.compile = function(schema, copts) {
     var c = compileFields(schema);
+    var ext = !!(copts && copts.extensible), big = !!(copts && copts.bigint);
+    if (ext) checkExtensible(c);
     return {
         encode: function(data) {
             data = data || {};
@@ -1368,9 +1588,10 @@ litepack.compile = function(schema) {
         },
         decode: function(buf, opts) {
             buf = normalizeBuf(buf, opts);
-            var data = {};
-            decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
-            return data;
+            return decodeAll(c, buf, ext || !!(opts && opts.extensible), big || !!(opts && opts.bigint));
+        },
+        tryDecode: function(buf, opts) {
+            try { return this.decode(buf, opts); } catch (e) { return null; }
         },
         byteLength: function(data) {
             return estimateFieldSize(c.fields, c.optionalCount, data || {});
@@ -1434,8 +1655,11 @@ litepack.decodeFrom = function(schema, buf, offset, opts) {
     buf = normalizeBuf(buf, opts);
     offset = offset || 0;
     var c = compileDef(schema);
-    var data = {};
+    var data = {}, prev = _ext, prevBig = _big;
+    if (opts && opts.extensible) checkExtensible(c);
+    _ext = !!(opts && opts.extensible); _big = !!(opts && opts.bigint);
     var end = decodeFields(c.fields, c.optionalCount, buf, offset, data, buf.length);
+    _ext = prev; _big = prevBig;
     return { value: data, bytesRead: end - offset };
 };
 
@@ -1477,10 +1701,11 @@ litepack.concat = function(list) {
  */
 litepack.reader = function(buf, opts) {
     buf = normalizeBuf(buf, opts);
+    var ropts = opts && (opts.extensible || opts.bigint) ? { extensible: !!opts.extensible, bigint: !!opts.bigint } : undefined;
     var r = {
         offset: 0,
         read: function(schema) {
-            var res = litepack.decodeFrom(schema, buf, r.offset);
+            var res = litepack.decodeFrom(schema, buf, r.offset, ropts);
             r.offset += res.bytesRead;
             return res.value;
         },
@@ -1488,7 +1713,7 @@ litepack.reader = function(buf, opts) {
             try { return r.read(schema); } catch (e) { return null; }
         },
         peek: function(schema) {
-            return litepack.decodeFrom(schema, buf, r.offset).value;
+            return litepack.decodeFrom(schema, buf, r.offset, ropts).value;
         },
         skip: function(n) { r.offset += n; return r; },
         remaining: function() { return buf.length - r.offset; },
@@ -1545,35 +1770,15 @@ litepack.writer = function() {
  *   litepack.assertComplete(certSignProto, cert);   // throws with field path
  *   var bytes = litepack.encode(certSignProto, cert);
  */
-litepack.assertComplete = function(schema, data, _path) {
-    var c = compileDef(schema);
-    var path = _path || '';
-    data = data || {};
-    for (var i = 0; i < c.fields.length; i++) {
-        var f = c.fields[i];
-        var val = data[f.name];
-        if (f.optional) continue;
-        if (val === undefined || val === null) {
-            throw new Error("litepack: missing required field '" + path + f.name + "'");
-        }
-        if (f.type === 'struct' && f.structDef) {
-            litepack.assertComplete._check(f.structDef, val, path + f.name + '.');
-        }
-    }
+/**
+ * Throws exactly when encode would throw: a missing required field (nested
+ * ones too - array items, variant branches, map values), a wrong type, a value
+ * out of range. encode already checks all of this in 2.0; this stays for code
+ * that wants the check without the bytes.
+ */
+litepack.assertComplete = function(schema, data) {
+    litepack.encode(schema, data);
     return true;
-};
-litepack.assertComplete._check = function(compiled, data, path) {
-    for (var i = 0; i < compiled.fields.length; i++) {
-        var f = compiled.fields[i];
-        var val = (data || {})[f.name];
-        if (f.optional) continue;
-        if (val === undefined || val === null) {
-            throw new Error("litepack: missing required field '" + path + f.name + "'");
-        }
-        if (f.type === 'struct' && f.structDef) {
-            litepack.assertComplete._check(f.structDef, val, path + f.name + '.');
-        }
-    }
 };
 
 // Built-in 'json' type — escape hatch for free-form data inside a binary
@@ -1584,7 +1789,11 @@ litepack.codec('json', {
     decode: function(b) { return JSON.parse(utf8Decode(b, 0, b.length)); }
 });
 
-litepack.version = '1.2.2';
+BUILTIN = {};
+for (var _t in TYPES) if (TYPES.hasOwnProperty(_t)) BUILTIN[_t] = true;
+BUILTIN.timestamp = true;
+
+litepack.version = '2.0.0';
 
 return litepack;
 

@@ -22,13 +22,19 @@ Then every message pays for its own key names, quotes, and decimal digits:
 {"type":64,"sub":8,"subjectPeerId":918273645,"name":"peer-x1","vals":[1,22,333,4444,55555]}
 
 // litepack — 25 bytes. Same data:
-40 08 CD 8F E5 B5 03 07 70 65 65 72 2D 78 31 05 01 16 CD 02 DC 22 A3 B2 03
+40 08 ED FC EE B5 03 07 70 65 65 72 2D 78 31 05 01 16 CD 02 DC 22 83 B2 03
 ```
 
 The schema lives in your code (or a shared JSON file), so key names never
 travel. Integers use variable-length encoding — small numbers cost 1 byte.
 Enums become indices. Flags pack into bits. **70–90% smaller than JSON** on
 typical structured messages.
+
+**One value, one encoding.** litepack 2.0 is strict both ways: `encode`
+never coerces (a string where a number belongs, `1.7` for an integer, a
+missing field — all throw), and `decode` accepts only the exact bytes
+`encode` would write (no padded varints, no trailing bytes, no unknown bits).
+So the bytes can be hashed, signed, deduplicated and compared safely.
 
 ### When to use it
 
@@ -39,7 +45,8 @@ typical structured messages.
 * 💾 **Compact storage** — millions of small records in IndexedDB, Redis,
   or files.
 * ✍️ **Canonical bytes for signing** — deterministic output, unlike
-  `JSON.stringify` (which depends on key order).
+  `JSON.stringify` (which depends on key order), and a decoder that accepts
+  nothing else: no two byte strings decode to the same message.
 
 ### When NOT to use it
 
@@ -100,7 +107,7 @@ var userProto = [
 var buf = litepack.encode(userProto, {
     id: 12345, name: 'Aviv', email: 'aviv@example.com', age: 30
 });
-// → Uint8Array(29)   (~70 bytes as JSON)
+// → Uint8Array(26)   (62 bytes as JSON)
 
 // 3. Decode
 var user = litepack.decode(userProto, buf);
@@ -166,7 +173,7 @@ var proto = [
     ['name',  'string'],
     ['email', 'string?']
 ];
-litepack.encode(proto, { id: 300, name: 'Dan' });   // email omitted
+litepack.encode(proto, { id: 300, flags: { active: 0, mode: 0 }, name: 'Dan' });   // email omitted
 ```
 
 Wire bytes: `00 AC 02 00 03 44 61 6E`
@@ -189,7 +196,7 @@ delimiters, no type tags — the schema on both sides is the contract.
 | Type | Wire size | Use for |
 |---|---|---|
 | `uint8/16/32`, `int8/16/32` | 1/2/4 B fixed | values with a known range |
-| `uint64`, `int64` | 8 B | file sizes, big ids (BigInt beyond 2^53) |
+| `uint64`, `int64` | 8 B | file sizes, big ids (Number; `{bigint:true}` for BigInt) |
 | `varint` | 1-8 B | counts, ids, timestamps — usually small, sometimes big |
 | `svarint` | 1-8 B | signed deltas, coordinates |
 | `timestamp` | = varint | readability alias |
@@ -197,7 +204,7 @@ delimiters, no type tags — the schema on both sides is the contract.
 | `bool` | 1 B | single flag (many flags → `bits`) |
 | `string` | len + UTF-8 | text |
 | `bytes` | len + raw | binary blobs |
-| `fixed`, `uuid` | exactly N / 16 B | hashes, keys, ids — no prefix |
+| `fixed`, `uuid` | exactly N / 16 B | hashes, keys, ids — no prefix (arrays of them too) |
 | `tail` | rest of buffer | final blob, top-level last field only |
 | `enum` | 1+ B index | one choice from a list |
 | `set` | 1+ B bitmask | multiple choices from a list (≤52) |
@@ -220,8 +227,8 @@ Any type + `?` = optional (zero bytes when absent).
 ['altitude', 'int16']       // -32768..32767             (2 bytes)
 ['color',    'uint32']      // 0..4294967295             (4 bytes)
 ['time',     'int32']       // signed 32-bit             (4 bytes)
-['filesize', 'uint64']      // 0..2^64                   (8 bytes, BigInt above 2^53)
-['balance',  'int64']       // signed 64-bit             (8 bytes, BigInt beyond ±2^53)
+['filesize', 'uint64']      // 0..2^64                   (8 bytes, see 64-bit below)
+['balance',  'int64']       // signed 64-bit             (8 bytes, see 64-bit below)
 ['count',    'varint']      // unsigned, variable size   (1 byte for 0-127, 2 for 128-16383…)
 ['delta',    'svarint']     // SIGNED varint (zigzag)    (-1 → 1 byte; small magnitudes stay small)
 ```
@@ -231,8 +238,18 @@ usually small but occasionally big. Fixed-width types (`uint32` etc.) when
 the value is uniformly distributed (hashes, colors) — a varint would
 *cost* more there. `svarint` for deltas and coordinates that go negative.
 
-> ⚠️ `varint` is unsigned by design — encoding a negative value **throws**
-> (use `svarint`). Values above 2^53-1 also throw (use `uint64`).
+> ⚠️ Every integer type is strict: the value must be a JS integer of the
+> right kind and in range, or it **throws** — no masking (`300` as `int8`),
+> no flooring (`1.7` as `varint`), no "not a number, so 0" (`'5'`). `varint`
+> is unsigned (negative → use `svarint`) and stops at 2^53-1 (use `uint64`).
+> A `BigInt` is accepted wherever its value fits.
+
+**64-bit.** `uint64`/`int64` encode from a Number (a safe integer) or a
+BigInt. They decode to a Number, and a value beyond 2^53 **throws** — 1.x
+returned a BigInt for those values only, so one field came back as two
+types. If the field can hold big values, decode with `{bigint: true}` and
+always get a BigInt (slower: about 25-50% on a message of 64-bit fields,
+which is why it is an option).
 
 ### Floats & Bool
 
@@ -255,10 +272,15 @@ the value is uniformly distributed (hashes, colors) — a varint would
 32 bytes on the wire, not 33. `tail` saves it for the final variable blob.
 
 `fixed` and `uuid` are **strict on encode**: the value must be bytes
-(`Uint8Array`, `Buffer`, or an array of numbers) of exactly that length.
-Anything else throws — a 64-character hex string given to `['hash','fixed',32]`
-is a bug, not 32 bytes to cut it to. Decode hex/base64 to bytes first. A
-missing value (`undefined`/`null`) encodes as zeros, like any missing scalar.
+(`Uint8Array`, `Buffer`, `ArrayBuffer`, or an array of integers 0..255) of
+exactly that length. Anything else throws — a 64-character hex string given
+to `['hash','fixed',32]` is a bug, not 32 bytes to cut it to. Decode
+hex/base64 to bytes first. A missing value throws, like any missing required
+field. `bytes` and `tail` take the same inputs; other typed arrays are
+refused (`Int16Array([300])` would otherwise go out as `44`).
+
+Lists of hashes or keys: `['keys', 'array', 'fixed', 32]` (each item exactly
+32 bytes), or with a fixed count `['pair', 'array', 'fixed', 32, 2]`.
 
 > ⚠️ On decode, `bytes` / `fixed` / `tail` return **views** into the input
 > buffer (zero-copy, fast). If you reuse or mutate the network buffer after
@@ -334,7 +356,9 @@ litepack.tryDecode(msgProto, buf);      // returns null if byte 0 isn't 64
 
 Perfect for message-type codes and magic bytes: the constant disappears
 from your data objects, and every decode validates it for free — a frame
-with the wrong msgcode is rejected before you look at it. Any simple base
+with the wrong msgcode is rejected before you look at it. If the data does
+carry the field, it must equal the constant (a message object of another
+type is a bug, and throws). Any simple base
 type works, including `'string'` for protocol magic (`['magic','const','string','LP1']`).
 
 ### Map (dynamic keys)
@@ -352,6 +376,13 @@ metadata, per-name counters, id-indexed records. Wire format: varint count
 + (key, value) pairs. Far more compact than the `json` type
 (`{a:1,b:2,c:3}` → 10 bytes vs 20).
 
+**Canonical order.** Keys are written sorted — numbers ascending, strings
+by Unicode code point (the order of their UTF-8 bytes, reproducible in any
+language) — so `{b:2,a:1}` and `{a:1,b:2}` give the same bytes. Decode
+refuses keys out of order or repeated (1.x let the last one win). An object
+whose keys are already in order costs nothing extra; an unsorted one is
+sorted on every encode (about a third slower for a 5-key map).
+
 ### Timestamps & UUIDs
 
 ```js
@@ -367,6 +398,11 @@ metadata, per-name counters, id-indexed records. Wire format: varint count
 
 For the part of a message that's genuinely free-form. Not compact — it's
 `JSON.stringify` with a length prefix — but always available.
+
+> ⚠️ `json` is the one type that is **not canonical**: its bytes follow the
+> object's key order, and decode does not check the text's form (sorting
+> keys deeply would cost on every message). Keep it out of anything you hash
+> or sign — use a `map` or a `struct` there.
 
 ### Enum & Set
 
@@ -384,9 +420,10 @@ Strictness rules that catch real bugs:
 
 * Encoding a value **not in the list throws** — a typo like `'inActive'`
   would otherwise silently become a *different valid value* (index 0).
-* A raw non-negative **number** passes through an enum untouched — forward
-  compatibility for values defined by a newer peer. Decoding an
-  out-of-range index likewise returns the raw number.
+* A raw non-negative integer passes through an enum on encode. On decode,
+  an index beyond the list (or set bits beyond the options) **throws** —
+  unless the schema is extensible (`{extensible: true}`), where it comes
+  back as the raw number: a value defined by a newer peer.
 * `set` supports up to **52 options** (varint bitmask limit) — more than
   that is a compile-time error, not silent corruption.
 
@@ -405,7 +442,9 @@ litepack.encode(s, { flags: { active: 1, mode: 5, quality: 12 } });
 
 Perfect for sensor readings, permissions, and protocol flags. Subfield
 widths are 1–32 bits each; the total can exceed 32 bits — it packs
-correctly across as many bytes as needed.
+correctly across as many bytes as needed. Every subfield must be present
+and fit its width (`mode: 8` in 3 bits throws instead of becoming `0`);
+`true`/`false` count as 1/0. Unused padding bits must decode as zero.
 
 ### Struct (Nested)
 
@@ -503,19 +542,31 @@ through your code.
 
 #### `litepack.encode(schema, data)` → `Uint8Array`
 
-**Throws** on invalid data: unknown enum/set values, negative `varint`,
-values above 2^53-1, out-of-range fixed-width integers, a `fixed`/`uuid`
-value that is not bytes of exactly the declared length, misplaced `tail`. Missing optional fields are free;
-missing required scalars encode as zero-values (see `assertComplete` to
-forbid that).
+**Throws** on anything it would otherwise have to guess: a missing required
+field (at any depth — array items, variant branches, map values), a value of
+the wrong JS type, a non-integer or out-of-range integer, unknown enum/set
+values, a variant value with no branch, a `const` field holding another
+value, a fixed-count array of another length, a bits subfield that does not
+fit, a string with a lone surrogate, bytes that are not bytes. Missing
+optional fields are free.
 
 #### `litepack.decode(schema, buf)` → `object`
 
 Accepts `Uint8Array` or `ArrayBuffer`. **Throws** on malformed input —
 truncation, declared lengths exceeding the buffer, varint bombs, impossible
-array counts — with the failing field named in the error. Trailing bytes
-after the last field are ignored (that's what makes schema evolution work;
-see below).
+array counts — and on any byte string `encode` would not have produced:
+trailing bytes, padded varints, optional bits for fields the schema lacks,
+an enum index or variant it does not know, a bool byte other than 0/1, a
+NaN other than the one encode writes, invalid UTF-8, map keys out of order.
+The failing field or byte is named in the error.
+
+Options (third argument):
+
+* `{extensible: true}` — for schemas that evolve (see Schema evolution):
+  trailing bytes, unknown optional bits, enum indices, set bits and variants
+  from a newer peer are tolerated.
+* `{bigint: true}` — `uint64`/`int64` always decode to BigInt.
+* `{copy: true}` — detach decoded bytes from the input buffer (below).
 
 Pass `{copy: true}` as a third argument to detach decoded `bytes` /
 `fixed` / `uuid` / `tail` views from the input buffer (one clone of the
@@ -537,13 +588,18 @@ if (!msg) return;              // hostile/corrupt input handled, done
 
 ### Precompiled handles
 
-#### `litepack.compile(schema)` → `{ encode, decode, byteLength }`
+#### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength }`
 
 ```js
 var Cert = litepack.compile(certProto);
 var buf  = Cert.encode(data);
 var obj  = Cert.decode(buf);
+
+var Presence = litepack.compile(presenceProto, { extensible: true });   // an evolving schema
 ```
+
+Options given to `compile` (`extensible`, `bigint`) apply to every decode
+through the handle.
 
 Schemas used with `encode`/`decode` directly are compiled once and cached
 via `WeakMap` — your schema array is never mutated and frozen schemas work.
@@ -560,10 +616,9 @@ and "will this fit in one packet?" checks.
 
 #### `litepack.assertComplete(schema, data)` → `true | throws`
 
-Throws if any **non-optional** field is `undefined`/`null`, recursing into
-structs, with the full field path in the message. Essential before
-producing canonical/signed bytes, where "missing field silently encodes as
-empty" would let a broken record produce a valid-looking signature:
+Throws exactly when `encode` would — a missing required field at any depth,
+a wrong type, a value out of range. Since 2.0 `encode` checks all of this
+itself, so this is only for code that wants the check without the bytes:
 
 ```js
 litepack.assertComplete(certSignProto, cert);
@@ -615,7 +670,9 @@ var schema = [['id', 'uint32'], ['payload', 'cbor']];
 `encode` must be deterministic (same value → same bytes). litepack detects
 a size mismatch between the sizing pass and the writing pass and throws,
 rather than emitting a corrupted buffer. Provide `estimateSize(val)` to
-skip the extra sizing encode for large values.
+skip the extra sizing encode for large values. Built-in type names
+(`string`, `varint`, `json`, …) are reserved: 1.x let `codec('string', …)`
+silently replace the string type in every schema.
 
 ## 🔗 Streaming & chaining: multiple messages, one buffer
 
@@ -809,28 +866,46 @@ switch (msg.msgType) { /* fields of the matching branch are on msg */ }
 
 ## 🧬 Schema evolution
 
-Protocols change. The rules for staying compatible are simple and
-mechanical:
+By default a schema is **closed**: decode accepts exactly the bytes encode
+writes for that schema. That is what you want for anything hashed or signed.
+A schema that will grow while old and new peers talk to each other declares
+it, and follows two rules.
 
-**✅ Safe — add optional fields at the END:**
+**1. Give it an optional field from its first version.** All optional
+fields share one bitmask at the *start* of the message. A schema with no
+optional field has no bitmask, so adding the first one later inserts a byte
+in front of every field — and an old reader misreads all of them. (1.x's own
+example here did exactly that, silently: `id: 4` came back as `1`.)
+
+**2. Add new fields at the end, as optional fields, and decode with
+`{extensible: true}`.**
 
 ```js
 // v1                                  // v2
-[['id','varint'],                      [['id','varint'],
- ['name','string']]                     ['name','string'],
+[['id',  'varint'],                    [['id',  'varint'],
+ ['name','string'],                     ['name','string'],
+ ['ext', 'varint?']]   // reserved      ['ext', 'varint?'],
                                         ['battery','uint8?']]   // ← new, optional, last
+
+var V1 = litepack.compile(v1, { extensible: true });
 ```
 
-* Old decoder + new message → reads its known fields, **ignores the
-  trailing bytes**. Works.
-* New decoder + old message → `battery` bit absent in the bitmask →
-  `undefined`. Works.
+* Old decoder + new message → reads its known fields; the unknown optional
+  bit and the trailing bytes are tolerated. Works.
+* New decoder + old message → `battery` bit absent → `undefined` (or its
+  default). Works.
+* `{extensible: true}` on a schema without any optional field **throws** —
+  it is rule 1, checked for you.
+
+In extensible mode an enum index, set bit or variant value the reader does
+not know comes back raw (`_unknownVariant: true` for variants) instead of
+throwing.
 
 **❌ Breaking — never do these to a live protocol:**
 
 * Insert/remove/reorder fields anywhere but the end.
 * Change a field's type.
-* Add a *required* field (old messages will fail to decode as truncated).
+* Add a *required* field (old messages fail to decode as truncated).
 * Reorder `enum`/`set` option lists (indices are the wire values — append
   new options at the end only).
 
@@ -844,12 +919,20 @@ Two trust levels, by design:
 | Direction | Policy | Why |
 |---|---|---|
 | **encode** (your data) | strict — throws on typos, negatives, overflow, wrong-length `fixed`/`uuid`, misplaced `tail` | a bug in *your* code should explode in dev, not ship corrupted bytes |
-| **decode** (their data) | defensive — bounded, validated; throws (or `tryDecode` → `null`) on anything malformed | wire input is attacker-controlled; garbage in must never mean garbage out, OOM, or a CPU spin |
+| **decode** (their data) | defensive and canonical — bounded, validated; throws (or `tryDecode` → `null`) on anything malformed or on any second encoding of a valid message | wire input is attacker-controlled; garbage in must never mean garbage out, OOM, or a CPU spin — and one message must never have two byte forms (two ids, two signatures) |
 
 Decode hard limits: varints capped at 8 bytes; array counts validated
 against remaining buffer bytes **before** allocation; every declared length
 checked before use; truncation detected per-field with the field name in
 the error.
+
+**The canonical guarantee:** for every schema, if `decode(schema, bytes)`
+succeeds then `encode(schema, result)` returns exactly `bytes`. The test
+suite checks it on 10,000 corrupted messages per run.
+
+**Defaults:** where safety costs speed, speed is the default and safety an
+option (`{copy:true}`, `{bigint:true}`); where it costs nothing, safety is
+the default.
 
 ## ⚡ Performance
 
@@ -862,6 +945,13 @@ Measured on Node 22 (1M iterations, typical small messages):
 | decode, enum+set message | ~7.5M ops/s |
 | encode, 5 structs w/ nested arrays | ~400K ops/s |
 | chained writer (2 parts) | no penalty vs merged schema |
+
+2.0 against 1.2.2 on the same machine (`node bench.js litepack-1.2.2.js
+litepack.js`): the strict checks are within measurement noise (±10%) on
+every message type, and short-string decoding is faster (an ASCII fast
+path). Two costs remain, both only where the work is real: an **unsorted**
+map is sorted on encode (≈ −33% for a 5-key map; sorted input costs
+nothing), and `{bigint:true}` decoding (≈ −25-50%, opt-in).
 
 Under the hood: schemas compile once to closures (cached by identity),
 string sizing scans without allocating, UTF-8 encodes straight into the
@@ -896,6 +986,34 @@ var schema = JSON.parse(fs.readFileSync('schema.json'));   // parse ONCE
 litepack.encode(schema, data);                             // reuse the array
 ```
 
+## 🔄 Migrating from 1.x to 2.0
+
+The **wire format is unchanged** for valid data: every message 1.2.2
+encodes, 2.0 encodes to the same bytes (tested on 2,000 random messages) —
+except maps, whose keys are now written in sorted order. What changes is
+what is *accepted*:
+
+* **encode throws where 1.x guessed:** missing required fields (were zero
+  values), wrong JS types (`'5'` or `5n` as `varint` were `0`), non-integers
+  (were floored/rounded), out-of-range signed ints (were masked), `uint64`
+  Numbers beyond 2^53 (were rounded), bits values too wide (were masked) or
+  missing (were 0), unknown variant values (branch fields were dropped), a
+  `const` field holding another value, fixed-count arrays of another length
+  (were padded with zeros), bytes given as other typed arrays.
+* **decode throws where 1.x accepted:** trailing bytes, padded varints,
+  unknown optional bits / enum indices / set bits / variants — all allowed
+  again with `{extensible: true}` — and, always: bool bytes other than 0/1,
+  non-canonical NaN, invalid UTF-8 (was replaced by U+FFFD), map keys out of
+  order or repeated, non-zero bits padding.
+* **`uint64`/`int64` decode to Number**, and throw beyond 2^53; use
+  `{bigint: true}` for BigInt (1.x mixed the two by value).
+* **A leading U+FEFF in a string is kept** (1.x's decoder dropped it).
+* **`codec()` refuses built-in type names.**
+* **`assertComplete`** now covers nested structures and no longer asks for
+  `const` fields.
+* New: arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
+  compiled handles, `{extensible}`, `{bigint}`.
+
 ## 🔄 Migrating from 1.0
 
 The **wire format is unchanged** — 1.0 and 1.1 peers interoperate freely.
@@ -924,15 +1042,17 @@ Behavior changes to be aware of:
 
 ```
 litepack.js             — single file, UMD, zero dependencies
-litepack.d.ts           — TypeScript declarations (editor autocomplete)
-litepack.test.js        — core test suite
+litepack.d.ts           — TypeScript declarations (editor autocomplete; needs the 2.0 options)
+litepack.test.js        — core test suite (1.x; expectations of coercion need updating)
 litepack.chain.test.js  — streaming/composition test suite
+litepack.v2.test.js     — 2.0: strict encode/decode, options, wire compatibility, canonical fuzz
+bench.js                — node bench.js <old build> <new build>
 litepack-tool.html      — interactive schema builder & tester
 ```
 
 ## ⚠️ Common pitfalls
 
-The five mistakes everyone makes once — read this and make zero:
+The six mistakes everyone makes once — read this and make zero:
 
 **1. Field order IS the protocol.** There are no field names or tags on the
 wire. If the sender's schema says `[id, name]` and the receiver's says
@@ -954,6 +1074,12 @@ coordinates that go negative → `svarint`.
 malformed bytes — correct for your own data, but an unhandled exception in
 a socket handler if a hostile peer sends garbage. `tryDecode` → `null` →
 `return`.
+
+**6. A schema that will evolve needs an optional field from day one.** The
+optional bitmask sits at the start of the message; adding the *first*
+optional field later shifts every field for old readers. Reserve one
+(`['ext','varint?']`) and decode with `{extensible: true}` — see Schema
+evolution.
 
 ## 🥊 How does it compare?
 
