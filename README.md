@@ -59,10 +59,11 @@ So the bytes can be hashed, signed, deduplicated and compared safely.
 ## 📖 Contents
 
 * [Installation](#-installation) · [Quick Start](#-quick-start) · [Complete example](#-complete-example-clientserver-over-websocket)
-* [What the bytes look like](#-what-the-bytes-look-like) · [Types](#-types) · [API](#-api)
-* [Streaming & chaining](#-streaming--chaining-multiple-messages-one-buffer) · [Real-world examples](#-real-world-examples)
-* [Schema evolution](#-schema-evolution) · [Robustness](#-robustness-model) · [Performance](#-performance)
-* [Common pitfalls](#-common-pitfalls) · [How does it compare?](#-how-does-it-compare)
+* [What the bytes look like](#-what-the-bytes-look-like) · [Types](#-types) · [Field options](#-types) · [Named types & recursion](#named-types--recursion) · [Limits](#limits-min--max)
+* [API](#-api) · [Schema identity](#schema-identity) · [Errors](#errors) · [Streaming & chaining](#-streaming--chaining-multiple-messages-one-buffer)
+* [Real-world examples](#-real-world-examples) · [Schema evolution](#-schema-evolution) · [Robustness](#-robustness-model)
+* [Performance](#-performance) · [Size comparison](#-size-comparison) · [Moving from Protocol Buffers](#-moving-from-protocol-buffers)
+* [Migrating from 1.x](#-migrating-from-1x-to-20) · [Common pitfalls](#-common-pitfalls) · [How does it compare?](#-how-does-it-compare)
 
 ## 📦 Installation
 
@@ -88,7 +89,8 @@ importScripts('/js/litepack.js');     // → self.litepack
 
 Runs in Node.js, browsers, Service Workers, Bun and Deno. TypeScript
 declarations (`litepack.d.ts`) give you autocomplete even in plain-JS
-projects — just keep the file next to `litepack.js`.
+projects — just keep the file next to `litepack.js`. In TypeScript the data
+type follows from the schema ([TypeScript](#typescript)).
 
 ## 🚀 Quick Start
 
@@ -248,7 +250,7 @@ compile error — a typo never passes silently.
 ['altitude', 'int16']       // -32768..32767             (2 bytes)
 ['color',    'uint32']      // 0..4294967295             (4 bytes)
 ['time',     'int32']       // signed 32-bit             (4 bytes)
-['filesize', 'uint64']      // 0..2^64                   (8 bytes, see 64-bit below)
+['filesize', 'uint64']      // 0..2^64-1                 (8 bytes, see 64-bit below)
 ['balance',  'int64']       // signed 64-bit             (8 bytes, see 64-bit below)
 ['count',    'varint']      // unsigned, variable size   (1 byte for 0-127, 2 for 128-16383…)
 ['delta',    'svarint']     // SIGNED varint (zigzag)    (-1 → 1 byte; small magnitudes stay small)
@@ -484,14 +486,14 @@ Strictness rules that catch real bugs:
 ### Bits (Bitfield Packing)
 
 ```js
-['flags', 'bits', [
+var s = [['flags', 'bits', [
     ['active',  1],     // 1 bit  — 0 or 1
     ['mode',    3],     // 3 bits — 0 to 7
     ['quality', 4]      // 4 bits — 0 to 15
-]]
+]]];
 // 8 bits total = exactly 1 byte on the wire
 
-litepack.encode(s, { flags: { active: 1, mode: 5, quality: 12 } });
+litepack.encode(s, { flags: { active: 1, mode: 5, quality: 12 } });   // → [0xDC]
 ```
 
 Perfect for sensor readings, permissions, and protocol flags. Subfield
@@ -657,8 +659,8 @@ var Chat = {
 
 Any type takes a `?` suffix — or, the same thing spelled out, the option
 `{optional: true}`. All optional fields in a struct share **one
-varint bitmask** at the front — 8 optionals cost 1 byte of overhead total,
-and each absent field costs nothing:
+varint bitmask** at the front — up to 7 optionals cost 1 byte of overhead
+in total (14 cost 2), and each absent field costs nothing:
 
 ```js
 ['email', 'string?']
@@ -707,8 +709,9 @@ peer's 10 MB string is refused by its length prefix, before it is decoded.
 This is the defence against oversized messages from the network — the
 schema says what a valid message is, and the decoder enforces it at the cost
 of one comparison. Limits are part of the schema's `schemaId`; `default` is
-not. Not for fixed-size types (`bool`, `fixed`, `enum`…) or fixed-count
-arrays, where they would mean nothing (compile error). Item limits for an
+not. Only lengths, counts and numbers take them — on `bool`, `fixed`,
+`enum`, `struct` and the like, or on a fixed-count array, they would mean
+nothing, so they are a compile error. Item limits for an
 array of strings: wrap the item in a struct.
 
 ## 📚 API
@@ -722,8 +725,10 @@ field (at any depth — array items, variant branches, map values), a value of
 the wrong JS type, a non-integer or out-of-range integer, unknown enum/set
 values, a variant value with no branch, a `const` field holding another
 value, a fixed-count array of another length, a bits subfield that does not
-fit, a string with a lone surrogate, bytes that are not bytes. Missing
-optional fields are free.
+fit, a string with a lone surrogate, bytes that are not bytes, a value
+outside its `{min, max}` or `chars`, nesting deeper than `maxDepth`. Missing
+optional fields are free. Every error carries a `code` and a `path`
+([Errors](#errors)).
 
 #### `litepack.decode(schema, buf)` → `object`
 
@@ -732,8 +737,10 @@ truncation, declared lengths exceeding the buffer, varint bombs, impossible
 array counts — and on any byte string `encode` would not have produced:
 trailing bytes, padded varints, optional bits for fields the schema lacks,
 an enum index or variant it does not know, a bool byte other than 0/1, a
-NaN other than the one encode writes, invalid UTF-8, map keys out of order.
-The failing field or byte is named in the error.
+NaN other than the one encode writes, invalid UTF-8, map keys out of order —
+and on anything outside the schema's own rules: `{min, max}` limits, `chars`
+alphabets, `maxDepth`. The error names the failing field (`err.path`) and
+byte.
 
 Options (third argument):
 
@@ -764,6 +771,9 @@ if (!msg) return;              // hostile/corrupt input handled, done
 ### Precompiled handles
 
 #### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength }`
+
+`schema` is a field list or an object schema (`{fields, types, maxDepth}`),
+here and in every other function.
 
 ```js
 var Cert = litepack.compile(certProto);
@@ -861,23 +871,50 @@ by a type-dependent body, or N messages packed into one send. See the
 dedicated section below for the full story.
 
 ```js
-litepack.writer()                       // chained-message builder
+var w = litepack.writer()               // chained-message builder
     .write(schemaA, dataA)              //   queue a message (chainable)
-    .raw(preEncodedBytes)               //   splice raw bytes (signatures, blobs)
-    .byteLength()                       //   total so far, without encoding
-    .bytes()                            //   → one exactly-sized Uint8Array
+    .raw(preEncodedBytes);              //   splice raw bytes (signatures, blobs)
+w.byteLength();                         //   total so far, without encoding
+w.bytes();                              //   → one exactly-sized Uint8Array
 
-var r = litepack.reader(buf);           // sequential cursor
+var r = litepack.reader(buf, opts?);    // sequential cursor; opts as for decode
 r.read(schema)                          //   decode next message + advance (throws)
 r.tryRead(schema)                       //   null on malformed, cursor NOT advanced
 r.peek(schema)                          //   decode without advancing
 r.skip(n)                               //   jump over foreign bytes
 r.remaining(); r.eof(); r.offset;
 
-litepack.decodeFrom(schema, buf, offset)        // → { value, bytesRead }
+litepack.decodeFrom(schema, buf, offset, opts?) // → { value, bytesRead }
 litepack.encodeInto(schema, data, buf, offset)  // → bytes written (throws if no fit)
 litepack.concat([buf1, buf2, ...])              // → one Uint8Array, single allocation
 ```
+
+### TypeScript
+
+`litepack.d.ts` (TypeScript 5+) derives the data type from the schema —
+declare it `as const`, or write it inline in the call:
+
+```ts
+const User = [['id', 'varint'], ['name', 'string'], ['email', 'string?']] as const;
+
+litepack.encode(User, { id: 1, name: 'Aviv' });      // ✓
+litepack.encode(User, { id: 1 });                    // ✗ Property 'name' is missing
+const u = litepack.decode(User, buf);                // { id: number; name: string; email?: string }
+
+type UserData = litepack.Infer<typeof User>;         // the same type, by name
+```
+
+Every type is covered: enums and sets become unions of their names, `bits`
+an object of its subfields, structs, arrays and maps nest, `const` fields
+are optional, variants become a union of branches (`if (m.kind === 2)
+m.lat` narrows), and named types resolve — recursion included. A schema that
+is not `as const` (built at runtime, or typed `litepack.Field[]`) gives
+`Record<string, any>`, as in 1.x. Errors are typed `litepack.LitepackError`
+(`code`, `path`, `truncated`).
+
+### Version
+
+`litepack.version` — the library version string (`'2.0.0'`).
 
 ### Custom codecs
 
@@ -1010,7 +1047,7 @@ offset += rec.bytesRead;
 ### P2P presence updates
 
 A peer announces its battery level to the swarm. As JSON:
-`{"type":64,"sub":6,"subjectPeerId":918273645,"value":88}` — **57 bytes**.
+`{"type":64,"sub":6,"subjectPeerId":918273645,"value":88}` — **56 bytes**.
 
 ```js
 var peerInfoProto = [
@@ -1036,7 +1073,7 @@ var stateProto = [
         ['flags', 'bits', [['alive',1], ['team',2], ['weapon',4], ['anim',5]]]
     ]]
 ];
-// 8 players ≈ 45 bytes/tick vs ~450 as JSON. At 30 ticks/sec: 1.3 KB/s vs 13 KB/s.
+// 8 players ≈ 44 bytes/tick vs ~610 as JSON. At 30 ticks/sec: 1.3 KB/s vs 18 KB/s.
 ```
 
 ### IoT sensor batch
@@ -1135,6 +1172,9 @@ throwing.
 * Add a *required* field (old messages fail to decode as truncated).
 * Reorder `enum`/`set` option lists (indices are the wire values — append
   new options at the end only).
+* Change a `chars` alphabet (indices are the characters) or tighten
+  `{min, max}` / `maxDepth` (old messages may now be rejected). Loosening a
+  limit is safe for new readers, but old readers still enforce the old one.
 
 For bigger changes, bump a version discriminator and use **variants** to
 carry both shapes during the transition.
@@ -1150,8 +1190,8 @@ Two trust levels, by design:
 
 Decode hard limits: varints capped at 8 bytes; array counts validated
 against remaining buffer bytes **before** allocation; every declared length
-checked before use; truncation detected per-field with the field name in
-the error.
+checked before use; recursive types nest at most `maxDepth` levels;
+truncation detected per-field with the field path in the error.
 
 **The canonical guarantee:** for every schema, if `decode(schema, bytes)`
 succeeds then `encode(schema, result)` returns exactly `bytes`. The test
@@ -1166,7 +1206,7 @@ ordinary own key (1.x let it replace the object's prototype), and schemas
 cannot name a field `__proto__`.
 
 **Other languages:** [SPEC.md](SPEC.md) defines the wire format byte by
-byte, and `spec/vectors.json` holds 140+ vectors (valid messages, messages
+byte, and `spec/vectors.json` holds 170+ vectors (valid messages, messages
 that must be rejected, values that must be refused, schema ids). A port
 conforms when it passes them all.
 
@@ -1176,15 +1216,22 @@ the default.
 
 ## ⚡ Performance
 
-Measured on Node 22 (1M iterations, typical small messages):
+Measured with `node bench.js` on Node 22 (best of 5 runs; one machine —
+compare builds on yours with `node bench.js <old> <new>`):
 
-| Operation | Throughput |
-|---|---|
-| encode, mixed message (ints + string + array) | ~1.2M ops/s |
-| decode, same | ~3.4M ops/s |
-| decode, enum+set message | ~7.5M ops/s |
-| encode, 5 structs w/ nested arrays | ~400K ops/s |
-| chained writer (2 parts) | no penalty vs merged schema |
+| Message | encode | decode |
+|---|---|---|
+| mixed (ints + string + array), 28 B | 3.9M ops/s | 5.7M ops/s |
+| enum + set, 3 B | 6.2M ops/s | 11.7M ops/s |
+| optionals (2 of 4) + bits, 11 B | 2.7M ops/s | 5.8M ops/s |
+| 5 structs with nested arrays, 31 B | 950K ops/s | 2.1M ops/s |
+| transaction-like (fixed 32 + arrays of structs), 80 B | 810K ops/s | 2.3M ops/s |
+| map, 5 string keys, 35 B | 2.0M ops/s | 2.8M ops/s |
+
+Chaining parts with `writer` costs nothing against one merged schema, and
+neither do error paths or named types that do not recurse. A `{min, max}`
+limit costs one comparison; a `chars` string decodes ~15% slower than a
+plain one.
 
 2.0 against 1.2.2 on the same machine (`node bench.js litepack-1.2.2.js
 litepack.js`): the strict checks are within measurement noise (±10%) on
@@ -1200,12 +1247,21 @@ maps, buffers are allocated exactly once per encode.
 
 ## 📊 Size comparison
 
-| Data | JSON | litepack | Saved |
-|---|---|---|---|
-| `{ id: 123, name: 'Aviv' }` | 27 bytes | 6 bytes | **78%** |
-| User with enum + set + array | 123 bytes | 26 bytes | **79%** |
-| Sensor with bitfields + tail | 95 bytes | 13 bytes | **86%** |
-| 5 stream-structs with nested arrays | 282 bytes | 39 bytes | **86%** |
+Bytes, same data in each format — reproduce with `node bench-sizes.js`
+(needs `npm i protobufjs @msgpack/msgpack`):
+
+| Message | JSON | MessagePack | protobuf | litepack |
+|---|---|---|---|---|
+| User record (enum, set, optional) | 112 | 85 | 40 | **35** |
+| Game state, 10 players (`bits`) | 589 | 393 | 190 | **111** |
+| 20 sensor readings, one struct each | 850 | 606 | 314 | **221** |
+| the same, as `deltas` + `bitset` columns | 850 | 606 | 314 | **71** |
+| 64 booleans (`bitset`) | 369 | 70 | 66 | **9** |
+| AddressBook (protobuf tutorial, 3 people) | 354 | 263 | 143 | **125** |
+| MediaContent (jvm-serializers benchmark) | 468 | 379 | 235 | **217** |
+
+Text-heavy messages gain least (MediaContent is 82% strings); `chars`
+alphabets cut that further when the text has a known alphabet.
 
 ## 💡 Schema as JSON
 
@@ -1225,6 +1281,57 @@ and client:
 var schema = JSON.parse(fs.readFileSync('schema.json'));   // parse ONCE
 litepack.encode(schema, data);                             // reuse the array
 ```
+
+Object schemas (`{"fields": [...], "types": {...}}`) are JSON too. Every
+option is JSON except a `BigInt` limit; a schema built in code can be
+saved with `JSON.stringify` and used as-is.
+
+## 🔁 Moving from Protocol Buffers
+
+`litepack-proto.js` (separate file, no dependencies) turns a `.proto` into a
+litepack schema plus converters for the data:
+
+```js
+var protobuf = require('protobufjs');               // only to read the .proto
+var lpProto  = require('./litepack-proto.js');
+
+var root = protobuf.loadSync('addressbook.proto');
+var m = lpProto.fromProto(root, 'tutorial.AddressBook');
+
+m.schema;                       // {fields, types} — save it as JSON, use it anywhere
+m.notes;                        // every mapping that is not one-to-one, in words
+
+// data: a protobufjs object ↔ litepack bytes
+var Book  = root.lookupType('tutorial.AddressBook');
+var obj   = Book.toObject(Book.decode(protobufBytes));
+var bytes = m.encode(litepack, obj);                 // = litepack.encode(m.schema, m.toLitepack(obj))
+var back  = Book.fromObject(m.decode(litepack, bytes));
+```
+
+| protobuf | litepack |
+|---|---|
+| fields | in field-number order — new numbers land at the end, litepack's evolution rule |
+| `int32`, `sint32` | `svarint` (protobuf spends 10 bytes on a negative `int32`) |
+| `uint32` | `varint` |
+| `int64`, `sint64`, `uint64` | `svarint` / `varint` — up to ±2^52 / 2^53; `{wide64: true}` for the full range (8 bytes) |
+| `fixed32/64`, `sfixed32/64` | `uint32/64`, `int32/64` |
+| `double`, `float`, `bool`, `string`, `bytes` | `float64`, `float32`, `bool`, `string`, `bytes` |
+| message | a named type — recursion included |
+| enum 0..n-1 | `enum` (by name) |
+| enum with gaps, negatives or aliases | `svarint` (the number); the converters translate names |
+| `repeated`, `map<K,V>` | `array`, `map` — optional, empty by default |
+| proto3 scalar (implicit presence) | optional with the zero `default` — absent costs nothing, as in protobuf |
+| `optional`, message fields, proto2 `optional` | optional (presence kept: `0` and absent stay different) |
+| `required` | required |
+| `oneof x { a; b; }` | a tag field `x`: `enum ['', 'a', 'b']` with one variant per member (`''` = none) |
+
+Not carried over: extensions and groups (an error names them). The bytes are
+not protobuf's — both sides switch, or a bridge decodes one and encodes the
+other. Tested against protobufjs: every scalar type, enums dense and sparse,
+maps (string, integer and bool keys; message and enum values), `oneof`,
+`optional`, recursion, proto2 `required`/defaults, and 500 random messages
+(28% smaller than protobuf); the tutorial's AddressBook goes from 143 to 125
+bytes, the MediaContent benchmark from 235 to 217.
 
 ## 🔄 Migrating from 1.x to 2.0
 
@@ -1303,15 +1410,19 @@ Behavior changes to be aware of:
 
 ```
 litepack.js             — single file, UMD, zero dependencies
-litepack.d.ts           — TypeScript declarations (editor autocomplete; needs the 2.0 options)
+litepack.d.ts           — TypeScript declarations: the data type inferred from the schema (TS 5+)
+types-test/             — type tests (npx tsc -p types-test)
 litepack.test.js        — core test suite (1.x; expectations of coercion need updating)
 litepack.chain.test.js  — streaming/composition test suite
 litepack.v2.test.js     — 2.0: strict encode/decode, options, wire compatibility, canonical fuzz
+litepack-proto.js       — .proto → litepack schema + data converters (no dependencies)
+proto-test/             — its tests against protobufjs (npm i protobufjs; node --test proto-test/litepack-proto.test.js)
 SPEC.md                 — the wire format, byte by byte (for ports to other languages)
 spec/vectors.json       — test vectors: valid, must-reject, must-refuse, schema ids
 spec/vectors.test.js    — runs the vectors against litepack.js (node --test spec/vectors.test.js)
 spec/gen-vectors.js     — regenerates vectors.json (asserts the hand-written hex first)
 bench.js                — node bench.js <old build> <new build>
+bench-sizes.js          — the size comparison table (JSON, MessagePack, protobuf, litepack)
 litepack-tool.html      — interactive schema builder & tester
 ```
 
@@ -1353,14 +1464,14 @@ An honest map of the landscape:
 
 | | Approach | Strong at | Weak at (vs litepack) |
 |---|---|---|---|
-| **litepack** | schema in code, single file | tiny messages, zero build step, JSON-storable schemas, `bits`/`set`/`tail`/variants, deterministic bytes | ecosystem size, cross-language ports |
-| **Protocol Buffers** | `.proto` files + codegen | huge ecosystem, every language, field-tag evolution (can delete fields) | heavy toolchain; requires build step or a large runtime; no bitfields |
+| **litepack** | schema in code, single file | tiny messages, zero build step, JSON-storable schemas, `bits`/`set`/`bitset`/`deltas`/`tail`/variants, recursion, built-in validation (`min`/`max`/`chars`), canonical bytes | ecosystem size, cross-language ports (a [SPEC](SPEC.md) and vectors exist) |
+| **Protocol Buffers** | `.proto` files + codegen | huge ecosystem, every language, field-tag evolution (can delete fields), keeps unknown fields | heavy toolchain; build step or a large runtime; not canonical; no validation or bitfields |
 | **MessagePack / CBOR** | schemaless | zero setup, any shape | sends key names in **every** message — 2-3× larger on small structured messages |
 | **FlatBuffers** | schema + zero-copy access | reading giant buffers without deserializing | complex API, codegen required, larger output for small messages |
 | **Avro** | schema as JSON | schema resolution between versions, big-data tooling | JVM-centric ecosystem, heavier runtime |
 
 **Where litepack wins:** small, frequent, structured messages — the
-per-message overhead of key names (MessagePack) or toolchain (protobuf)
+per-message overhead of key names (MessagePack) or field tags (protobuf)
 dominates exactly there. One file, no build step, runs in a Service
 Worker, schemas are plain arrays you can ship as JSON, and the output is
 deterministic enough to sign.
