@@ -617,6 +617,42 @@ Branch fields land in the same object as the parent's, so a name may appear
 once across a struct and its branches (sibling branches may share one);
 `compile` throws on a repeat.
 
+### Named types & recursion
+
+A schema can also be an object that names types. A name then works wherever
+a struct does — as a field, an array item, a map value — and may refer to
+itself or to other names:
+
+```js
+var Tree = {
+    types: {
+        Node: [['value', 'varint'], ['children', 'array', 'Node']]
+    },
+    fields: [['root', 'Node']]
+};
+litepack.encode(Tree, { root: { value: 1, children: [{ value: 2, children: [] }] } });
+
+var Chat = {
+    types: {
+        User:    [['id', 'varint'], ['name', 'string']],
+        Message: [['from', 'User'], ['text', 'string'], ['replyTo', 'Message?']]
+    },
+    fields: [['messages', 'array', 'Message'], ['members', 'map', 'string', 'User']]
+};
+```
+
+* **Depth ceiling.** A recursive type nests at most `maxDepth` levels (100;
+  set `{fields, types, maxDepth: 20}`), on encode and decode — a hostile
+  message cannot recurse until the stack runs out, and a cyclic object
+  (`a.children = [a]`) throws `LIMIT` instead of overflowing. Types that
+  cannot reach themselves skip the check and cost exactly what an inline
+  struct costs.
+* **Finite only.** A type that contains itself through required fields alone
+  (`Node: [['next', 'Node']]`) has no finite value; `compile` refuses it and
+  names the cycle. Make one link optional (`'Node?'`) or an array.
+* **Names** cannot be built-in types or codecs. `{fields: [...]}` with no
+  types is the same schema as the plain list (same `schemaId`).
+
 ### Optional Fields
 
 Any type takes a `?` suffix — or, the same thing spelled out, the option
@@ -1235,7 +1271,8 @@ What changes is what is *accepted*:
   type that takes none (`['a','varint',5]`).
 * New: `{optional: true}` (same as `?`), enum-tagged variants, arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
   compiled handles, `{extensible}`, `{bigint}`, `schemaId`,
-  `schemaBytes`, the `ascending`, `deltas` and `bitset` types, `{min, max}` limits,
+  `schemaBytes`, named and recursive types (`{fields, types, maxDepth}`),
+  the `ascending`, `deltas` and `bitset` types, `{min, max}` limits,
   [SPEC.md](SPEC.md) with test vectors.
 
 ## 🔄 Migrating from 1.0

@@ -73,7 +73,8 @@ function withPath(e, step) {
     if (!e || typeof e !== 'object' || !e.code) return e;    // not ours (a codec's own error): untouched
     if (e._msg === undefined) e._msg = e.message;
     e.path = e.path === undefined ? step : step + (e.path.charAt(0) === '[' ? '' : '.') + e.path;
-    e.message = e._msg + ' (at ' + e.path + ')';
+    // err.path is whole; the message shows at most its last 160 characters
+    e.message = e._msg + ' (at ' + (e.path.length > 160 ? '…' + e.path.slice(-160) : e.path) + ')';
     return e;
 }
 
@@ -963,6 +964,131 @@ function cloneDefault(v) {
     return v;
 }
 
+// ── Named types and recursion ───────────────────────────────
+// A schema may be an object: {fields: [...], types: {Node: [...]}, maxDepth}.
+// A type name then works wherever a struct does - ['root', 'Node'],
+// ['children', 'array', 'Node'], ['next', 'Node?'], a map value - and may
+// refer to itself or to other named types. Each name is compiled once per
+// schema; a reference to a name still being compiled gets the same (not yet
+// filled) object, which is how a type can contain itself.
+var _ctx = null;          // during compile: { types, compiled, maxDepth }
+var _depth = 0;           // nesting of named types during one encode/decode
+var DEFAULT_MAX_DEPTH = 100;
+var SCHEMA_KEYS = { fields: 1, types: 1, maxDepth: 1 };
+
+function compileSchema(schema) {
+    if (Array.isArray(schema)) {
+        var c = compileFields(schema);
+        c.src = schema;
+        return c;
+    }
+    if (!schema || typeof schema !== 'object') throw E('SCHEMA', 'litepack: a schema is a field list, or {fields, types}');
+    for (var k in schema) if (Object.prototype.hasOwnProperty.call(schema, k) && !SCHEMA_KEYS[k]) throw E('SCHEMA', "litepack: unknown schema key '" + k + "' (keys: fields, types, maxDepth)");
+    if (!Array.isArray(schema.fields)) throw E('SCHEMA', 'litepack: schema.fields must be a field list');
+    var types = schema.types || {}, max = schema.maxDepth === undefined ? DEFAULT_MAX_DEPTH : schema.maxDepth;
+    if (typeof types !== 'object' || Array.isArray(types)) throw E('SCHEMA', 'litepack: schema.types must be an object of field lists');
+    if (!(typeof max === 'number' && max >= 1 && max % 1 === 0)) throw E('SCHEMA', 'litepack: maxDepth must be a whole number of at least 1');
+    for (var name in types) {
+        if (!Object.prototype.hasOwnProperty.call(types, name)) continue;
+        if (TYPES[name] || _codecs[name] || name === 'timestamp' || /[?\s]/.test(name) || name === '' || name === '__proto__') throw E('SCHEMA', "litepack: '" + name + "' cannot name a type (built-in, codec, or not a plain name)");
+        if (!Array.isArray(types[name])) throw E('SCHEMA', "litepack: type '" + name + "' must be a field list");
+    }
+    var prev = _ctx;
+    _ctx = { types: types, compiled: Object.create(null), maxDepth: max };
+    try {
+        var out = compileFields(schema.fields);
+        for (name in types) if (Object.prototype.hasOwnProperty.call(types, name)) namedType(name);   // compile (and check) the unused ones too
+        for (name in _ctx.compiled) checkFinite(name, _ctx.compiled[name], []);
+        unguardAcyclic(out, _ctx.compiled);
+    } finally { _ctx = prev; }
+    out.src = schema;
+    return out;
+}
+
+function isNamed(t) { return _ctx !== null && Object.prototype.hasOwnProperty.call(_ctx.types, t); }
+
+function namedType(name) {
+    var got = _ctx.compiled[name];
+    if (got) return got;
+    var c = { fields: [], optionalCount: 0, name: name, src: null, twin: null };
+    _ctx.compiled[name] = c;                  // before compiling: a self-reference finds it
+    var real = compileFields(_ctx.types[name], true);
+    c.fields = real.fields; c.optionalCount = real.optionalCount;
+    return c;
+}
+
+// A type that holds itself through required fields only has no finite value.
+function checkFinite(name, c, trail) {
+    if (trail.indexOf(name) !== -1) {
+        throw E('SCHEMA', "litepack: type '" + name + "' contains itself through required fields (" + trail.concat(name).join(' → ') + ') — no finite value fits; make one of them optional or an array');
+    }
+    walkRequired(c.fields, function(n2, c2) { checkFinite(n2, c2, trail.concat(name)); });
+}
+function walkRequired(fields, visit) {
+    for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        if (f.optional) continue;
+        if (f.named) visit(f.named.name, f.named);
+        else if (f.type === 'struct' && f.structDef) walkRequired(f.structDef.fields, visit);
+    }
+}
+
+// Every field object, at any depth: array items, map values, variant
+// branches, anonymous structs - but not into named types (cycles).
+function eachField(fields, visit) {
+    for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        visit(f);
+        if (f.arrayItem) { visit(f.arrayItem); if (!f.arrayItem.named && f.arrayItem.structDef) eachField(f.arrayItem.structDef.fields, visit); }
+        if (f.mapDef) { visit(f.mapDef.valField); if (!f.mapDef.valField.named && f.mapDef.valField.structDef) eachField(f.mapDef.valField.structDef.fields, visit); }
+        if (!f.named && f.structDef) eachField(f.structDef.fields, visit);
+        if (f.variants) for (var k in f.variants) eachField(f.variants[k].fields, visit);
+    }
+}
+// Only a type that can reach itself needs the depth guard; a reference to any
+// other named type is a plain struct (the guard costs ~10% per struct).
+function unguardAcyclic(root, compiled) {
+    var refs = Object.create(null), name;
+    for (name in compiled) {
+        var out = refs[name] = [];
+        eachField(compiled[name].fields, function(f) { if (f.named) out.push(f.named.name); });
+    }
+    function reaches(from, target, seen) {
+        var r = refs[from];
+        for (var i = 0; i < r.length; i++) {
+            if (r[i] === target) return true;
+            if (!seen[r[i]]) { seen[r[i]] = true; if (reaches(r[i], target, seen)) return true; }
+        }
+        return false;
+    }
+    var cyclic = Object.create(null);
+    for (name in compiled) cyclic[name] = reaches(name, name, Object.create(null));
+    function strip(f) { if (f.named && !cyclic[f.named.name]) { f.write = f.plainWrite; f.read = f.plainRead; } }
+    eachField(root.fields, strip);
+    for (name in compiled) eachField(compiled[name].fields, strip);
+}
+
+// A field holding a named type: a struct, with a ceiling on how deep one
+// encode or decode may nest (a hostile message could otherwise recurse until
+// the stack runs out). The try/finally keeps the count right after an error;
+// only recursive schemas pay for it.
+function namedField(f, name) {
+    var c = namedType(name), max = _ctx.maxDepth;
+    var w = createStructWriter(c), r = createStructReader(c);
+    f.type = 'struct'; f.structDef = c; f.named = c; f.maxDepth = max; f.plainWrite = w; f.plainRead = r;
+    f.write = function(val, buf, pos) {
+        if (_depth >= max) throw E('LIMIT', "litepack: '" + name + "' nested deeper than maxDepth " + max);
+        _depth++;
+        try { return w(val, buf, pos); } finally { _depth--; }
+    };
+    f.read = function(buf, pos) {
+        if (_depth >= max) throw E('LIMIT', "litepack: '" + name + "' nested deeper than maxDepth " + max + ' at byte ' + pos);
+        _depth++;
+        try { return r(buf, pos); } finally { _depth--; }
+    };
+    return f;
+}
+
 function compileFields(fieldDefs, nested, seen) {
     var fields = [];
     var optionalCount = 0;
@@ -1013,6 +1139,8 @@ function compileFields(fieldDefs, nested, seen) {
             optional = opts.optional;
         }
         if (has(opts, 'count') && ftype !== 'array') throw E('SCHEMA', "litepack: field '" + fname + "' — count applies to arrays, not '" + ftype + "'");
+        var namedName = isNamed(ftype) ? ftype : null;
+        if (namedName !== null && fd.length > 2) throw E('SCHEMA', "litepack: field '" + fname + "' — type '" + ftype + "' takes no definition");
 
         if (ftype === 'tail') {
             // 'tail' means "the rest of the buffer" — only meaningful as the
@@ -1059,7 +1187,9 @@ function compileFields(fieldDefs, nested, seen) {
             }
         }
 
-        if (ftype === 'bits' && fd[2]) {
+        if (namedName !== null) {
+            namedField(f, namedName);
+        } else if (ftype === 'bits' && fd[2]) {
             // Bitfield
             f.bitsDef = compileBits(fd[2]);
             f.fixedSize = f.bitsDef.totalBytes;
@@ -1159,7 +1289,7 @@ function compileFields(fieldDefs, nested, seen) {
         fields.push(f);
     }
 
-    return { fields: fields, optionalCount: optionalCount, src: fieldDefs, twin: null };
+    return { fields: fields, optionalCount: optionalCount, src: null, twin: null };
 }
 
 function resolveType(name, fieldName) {
@@ -1374,7 +1504,9 @@ function compileMap(fd, fname) {
     var keyType = fd[2];
     var valType = fd[3];
     var def = { keyField: makeSimpleField(keyType, fname + '.<key>'), numericKeys: keyType !== 'string' };
-    if (valType === 'struct') {
+    if (isNamed(valType)) {
+        def.valField = namedField({ type: 'struct', fixedSize: null }, valType);
+    } else if (valType === 'struct') {
         if (!Array.isArray(fd[4])) {
             throw E('SCHEMA', "litepack: field '" + fname + "' — map with struct values needs a schema: ['" + fname + "', 'map', '" + keyType + "', 'struct', [...]]");
         }
@@ -1526,7 +1658,9 @@ function compileArrayItem(fd, fixedCount) {
     var itemField = { type: itemType, fixedSize: null };
     var nextIdx = 3;
 
-    if (itemType === 'struct' && Array.isArray(fd[nextIdx])) {
+    if (isNamed(itemType)) {
+        namedField(itemField, itemType);
+    } else if (itemType === 'struct' && Array.isArray(fd[nextIdx])) {
         itemField.structDef = compileFields(fd[nextIdx], true);
         itemField.write = createStructWriter(itemField.structDef);
         itemField.read = createStructReader(itemField.structDef);
@@ -1663,7 +1797,7 @@ function twinOf(c) {
     if (!c.twin) {
         var prev = _tracking;
         _tracking = true;
-        try { c.twin = compileFields(c.src); } finally { _tracking = prev; }
+        try { c.twin = compileSchema(c.src); } finally { _tracking = prev; }
     }
     return c.twin;
 }
@@ -1901,6 +2035,11 @@ function estimateSingleField(f, val) {
             }
             return ms;
         case 'struct':
+            if (f.named && f.write !== f.plainWrite) {
+                if (_depth >= f.maxDepth) throw E('LIMIT', "litepack: '" + f.named.name + "' nested deeper than maxDepth " + f.maxDepth);
+                _depth++;
+                try { return estimateFieldSize(f.structDef.fields, f.structDef.optionalCount, val || {}); } finally { _depth--; }
+            }
             return estimateFieldSize(f.structDef.fields, f.structDef.optionalCount, val || {});
         case 'array':
             var a = val || [];
@@ -1957,11 +2096,11 @@ var _compiled = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
 function compileDef(schema) {
     if (_compiled) {
         var c = _compiled.get(schema);
-        if (!c) { c = compileFields(schema); _compiled.set(schema, c); }
+        if (!c) { c = compileSchema(schema); _compiled.set(schema, c); }
         return c;
     }
     if (schema._lp) return schema._lp;
-    schema._lp = compileFields(schema);
+    schema._lp = compileSchema(schema);
     return schema._lp;
 }
 
@@ -1980,10 +2119,11 @@ litepack.encode = function(schema, data) {
     // .subarray() forces it out to a real ArrayBuffer (~650ns) — that was more
     // than the whole rest of encode. The estimate is exact for every built-in
     // type; if a custom codec ever breaks that, the overflow check still throws.
-    var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));
-    var pos;
-    try { pos = encodeFields(c.fields, c.optionalCount, data, buf, 0); }
-    catch (e) { throw traceEncode(e, c, data, buf.length, 0); }
+    var buf, pos;
+    try {
+        buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));
+        pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
+    } catch (e) { throw traceEncode(e, c, data, buf ? buf.length : 0, 0); }
     // Typed-array out-of-bounds writes are silently DROPPED — detect them,
     // never return silently corrupted bytes.
     if (pos > buf.length) throw E('CODEC', 'litepack: encoded size exceeded estimate — custom codec with non-deterministic encode()?');
@@ -2088,16 +2228,17 @@ litepack.codec = function(name, codec) {
  *   var obj  = Cert.decode(buf);
  */
 litepack.compile = function(schema, copts) {
-    var c = compileFields(schema);
+    var c = compileSchema(schema);
     var ext = !!(copts && copts.extensible), big = !!(copts && copts.bigint);
     if (ext) checkExtensible(c);
     return {
         encode: function(data) {
             data = data || {};
-            var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));   // exact — see litepack.encode
-            var pos;
-            try { pos = encodeFields(c.fields, c.optionalCount, data, buf, 0); }
-            catch (e) { throw traceEncode(e, c, data, buf.length, 0); }
+            var buf, pos;
+            try {
+                buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data));   // exact — see litepack.encode
+                pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
+            } catch (e) { throw traceEncode(e, c, data, buf ? buf.length : 0, 0); }
             if (pos > buf.length) throw E('CODEC', 'litepack: encoded size exceeded estimate — custom codec with non-deterministic encode()?');
             return pos === buf.length ? buf : buf.subarray(0, pos);
         },
@@ -2193,8 +2334,9 @@ litepack.decodeFrom = function(schema, buf, offset, opts) {
 litepack.encodeInto = function(schema, data, buf, offset) {
     offset = offset || 0;
     data = data || {};
-    var c = compileDef(schema);
-    var need = estimateFieldSize(c.fields, c.optionalCount, data);
+    var c = compileDef(schema), need;
+    try { need = estimateFieldSize(c.fields, c.optionalCount, data); }
+    catch (e) { throw traceEncode(e, c, data, 0, 0); }
     if (offset + need > buf.length) {
         throw E('BUFFER', 'litepack: encodeInto needs ' + need + ' bytes at offset ' + offset + ', buffer has ' + (buf.length - offset));
     }
@@ -2320,6 +2462,16 @@ function normType(t) {
     var opt = t.charAt(t.length - 1) === '?', b = opt ? t.slice(0, -1) : t;
     return (ALIAS[b] || b) + (opt ? '?' : '');
 }
+// An object schema: {"fields":..., "types":{...}} plus "maxDepth" when it is
+// not the default. A plain field list stays a list, so its id is unchanged.
+function normSchema(schema) {
+    if (Array.isArray(schema)) return normFields(schema);
+    var out = { fields: normFields(schema.fields) }, types = schema.types || {}, t = {}, any = false;
+    for (var k in types) if (Object.prototype.hasOwnProperty.call(types, k)) { t[k] = normFields(types[k]); any = true; }
+    if (any) out.types = t;
+    if (schema.maxDepth !== undefined && schema.maxDepth !== DEFAULT_MAX_DEPTH) out.maxDepth = schema.maxDepth;
+    return any || out.maxDepth !== undefined ? out : out.fields;   // {fields} alone means the list
+}
 function normFields(fds) {
     var out = [];
     for (var i = 0; i < fds.length; i++) out.push(normField(fds[i]));
@@ -2407,7 +2559,7 @@ function idEntry(schema) {
     var e = _ids && _ids.get(schema);
     if (!e) {
         compileDef(schema);            // an invalid schema throws here, not hashes
-        var input = utf8Encode('litepack-schema-v1\n' + canonJSON(normFields(schema)));
+        var input = utf8Encode('litepack-schema-v1\n' + canonJSON(normSchema(schema)));
         e = { input: input, id: murmur3(input) };
         if (_ids) _ids.set(schema, e);
     }
