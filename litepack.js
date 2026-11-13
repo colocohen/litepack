@@ -672,9 +672,13 @@ function cloneDefault(v) {
     return v;
 }
 
-function compileFields(fieldDefs, nested) {
+function compileFields(fieldDefs, nested, seen) {
     var fields = [];
     var optionalCount = 0;
+    // Field names share one object on decode - variant branches write into the
+    // parent's object - so a name may appear once across them. Two fields
+    // named 'id' would encode the value twice and decode the second only.
+    seen = seen || {};
 
     for (var i = 0; i < fieldDefs.length; i++) {
         var fd = fieldDefs[i];
@@ -686,6 +690,13 @@ function compileFields(fieldDefs, nested) {
         if (typeof ftype !== 'string') {
             throw new Error("litepack: field '" + fname + "' — type must be a string, got " + typeof ftype);
         }
+        if (typeof fname !== 'string' || fname === '' || fname === '__proto__') {
+            throw new Error('litepack: invalid field name ' + JSON.stringify(fname));
+        }
+        if (Object.prototype.hasOwnProperty.call(seen, fname)) {
+            throw new Error("litepack: field name '" + fname + "' appears twice (names must be unique in a struct and its variant branches)");
+        }
+        seen[fname] = true;
 
         // Options object at the END of the def: ['retries','varint?',{default:3}]
         // Recognized only when it's a plain object whose keys are all known
@@ -838,7 +849,9 @@ function compileFields(fieldDefs, nested) {
             f.fixedSize = typeDef.size;
             f.variants = {};
             for (var key in fd[2]) {
-                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key], nested);
+                // each branch sees the parent's names (one decoded object), but
+                // not its sibling branches' (only one branch is ever present)
+                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key], nested, Object.assign({}, seen));
             }
         } else {
             // Regular field
@@ -870,8 +883,13 @@ function resolveType(name, fieldName) {
 function compileBits(bitsDef) {
     var subFields = [];
     var totalBits = 0;
+    var names = Object.create(null);
     for (var i = 0; i < bitsDef.length; i++) {
-        var w = bitsDef[i][1];
+        var w = bitsDef[i][1], nm = bitsDef[i][0];
+        if (typeof nm !== 'string' || nm === '' || nm === '__proto__' || names[nm]) {
+            throw new Error('litepack: bits subfield name ' + JSON.stringify(nm) + ' is invalid or appears twice');
+        }
+        names[nm] = true;
         if (typeof w !== 'number' || w < 1 || w > 32) {
             throw new Error("litepack: bits field '" + bitsDef[i][0] + "' has invalid width " + w + ' (must be 1-32)');
         }
@@ -910,10 +928,15 @@ function createBitsWriter(def) {
         }
         return def.totalBytes;
     };
+    // Same layout as the fast path: the field is one big-endian integer, first
+    // subfield most significant, padding in the TOP bits of the first byte.
+    // (1.x put the padding at the bottom of the last byte above 31 bits, so
+    // adding a subfield that crossed 31 moved every existing one.)
+    var padW = def.totalBytes * 8 - def.totalBits;
     return function(val, buf, pos) {
         checkBits(def, val);
         for (var b = 0; b < def.totalBytes; b++) buf[pos + b] = 0;
-        var bitPos = 0;
+        var bitPos = padW;
         for (var i = 0; i < def.subFields.length; i++) {
             var sf = def.subFields[i];
             var v = bitVal(val[sf.name]) >>> 0;
@@ -944,9 +967,9 @@ function createBitsReader(def) {
         var _v = result; _n = def.totalBytes; return _v;
     };
     return function(buf, pos) {
-        if (pad && (buf[pos + def.totalBytes - 1] & ((1 << pad) - 1))) throw new Error('litepack: bits padding not zero at byte ' + pos);
+        if (pad && (buf[pos] >> (8 - pad))) throw new Error('litepack: bits padding not zero at byte ' + pos);
         var result = {};
-        var bitPos = 0;
+        var bitPos = pad;
         for (var i = 0; i < def.subFields.length; i++) {
             var sf = def.subFields[i];
             var v = 0;
@@ -964,15 +987,25 @@ function createBitsReader(def) {
 
 function buildIndexMap(opts) {
     // O(1) value→index lookup, built once at compile — indexOf is O(n) per call
+    // A plain object (a null-prototype one is a slow dictionary in V8, ~8%
+    // off enum/set encode); lookups check typeof === 'number', so a value
+    // like 'toString' cannot pick up Object.prototype's function.
     var m = {};
-    for (var i = 0; i < opts.length; i++) m[opts[i]] = i;
+    for (var i = 0; i < opts.length; i++) {
+        var o = opts[i];
+        if (o === '__proto__') throw new Error("litepack: '__proto__' cannot be an enum/set option");
+        // two equal options would encode as the first and decode the second
+        // back to the first name - two byte strings for one value
+        if (Object.prototype.hasOwnProperty.call(m, o)) throw new Error('litepack: option ' + JSON.stringify(o) + ' appears twice in an enum/set');
+        m[o] = i;
+    }
     return m;
 }
 
 function createEnumWriter(opts, fieldName) {
     var idxMap = buildIndexMap(opts);
     return function(val, buf, pos) {
-        var idx = idxMap[val] !== undefined ? idxMap[val] : -1;
+        var idx = idxMap[val]; if (typeof idx !== 'number') idx = -1;
         if (idx === -1) {
             // Silently encoding index 0 would turn a typo into a DIFFERENT valid value.
             // Numeric passthrough is allowed for forward-compat (value from a newer peer).
@@ -1005,7 +1038,7 @@ function createSetWriter(opts, fieldName) {
         if (!Array.isArray(val)) throw new TypeError("litepack: field '" + fieldName + "' — set expects an array");
         {
             for (var i = 0; i < val.length; i++) {
-                var idx = idxMap[val[i]] !== undefined ? idxMap[val[i]] : -1;
+                var idx = idxMap[val[i]]; if (typeof idx !== 'number') idx = -1;
                 if (idx === -1) {
                     throw new Error("litepack: field '" + fieldName + "' — unknown set value " + JSON.stringify(val[i]) + ' (options: ' + opts.join(', ') + ')');
                 }
@@ -1126,7 +1159,11 @@ function createMapReader(def) {
             if (i > 0 && cmpKeys(prev, k, num) >= 0) throw new Error('litepack: map keys out of order or repeated at byte ' + at);
             prev = k;
             var v = def.valField.read(buf, pos); pos += _n;
-            out[k] = v;
+            // out[k] = v with k === '__proto__' would REPLACE the object's
+            // prototype: the key vanishes from Object.keys and the attacker's
+            // fields show up as inherited properties (1.x did this)
+            if (k === '__proto__') Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+            else out[k] = v;
         }
         var _v = out; _n = pos - start; return _v;
     };
@@ -1557,6 +1594,8 @@ litepack.codec = function(name, codec) {
         read: function(buf, pos) {
             var len = readVarint(buf, pos), lb = _n;
             var s = pos + lb;
+            // without this the codec would see a silently shortened slice
+            if (s + len > buf.length) throw truncErr("litepack: truncated '" + name + "' at byte " + pos + ' (declared ' + len + ' bytes, ' + (buf.length - s) + ' remain)');
             var _v = codec.decode(buf.subarray(s, s + len)); _n = lb + len; return _v;
         },
         estimateSize: function(val) {
@@ -1595,7 +1634,8 @@ litepack.compile = function(schema, copts) {
         },
         byteLength: function(data) {
             return estimateFieldSize(c.fields, c.optionalCount, data || {});
-        }
+        },
+        schemaId: function(bytes) { return litepack.schemaId(schema, bytes); }
     };
 };
 
@@ -1792,6 +1832,142 @@ litepack.codec('json', {
 BUILTIN = {};
 for (var _t in TYPES) if (TYPES.hasOwnProperty(_t)) BUILTIN[_t] = true;
 BUILTIN.timestamp = true;
+
+// ── Schema identity ─────────────────────────────────────────
+//
+// schemaId(schema) names a schema by its MEANING on the wire: two schemas get
+// the same id exactly when they read and write the same bytes into the same
+// object shape. Peers send it in a handshake (or store it beside saved data)
+// to find out that they disagree BEFORE decoding garbage - litepack messages
+// carry no type information, so a mismatch is otherwise silent.
+//
+// Hashed: the canonical JSON below, prefixed 'litepack-schema-v1\n', SHA-256.
+// In:  field and subfield names, types (aliases resolved), '?' markers,
+//      enum/set option names and order, bits widths, fixed lengths, array
+//      fixed counts, const base+value, map key/value types, variant keys.
+// Out: {default: ...} options and decode options - they do not touch bytes.
+// Custom codecs enter by NAME only (their code cannot be hashed): bump the
+// codec's name when you change its encoding.
+
+var ALIAS = { timestamp: 'varint', uint8s: 'bytes' };
+function normType(t) {
+    var opt = t.charAt(t.length - 1) === '?', b = opt ? t.slice(0, -1) : t;
+    return (ALIAS[b] || b) + (opt ? '?' : '');
+}
+function normFields(fds) {
+    var out = [];
+    for (var i = 0; i < fds.length; i++) out.push(normField(fds[i]));
+    return out;
+}
+function normField(fd) {
+    if (fd.length > 2) {
+        var last = fd[fd.length - 1];
+        if (last && typeof last === 'object' && !Array.isArray(last) && isOptionsObject(last)) fd = fd.slice(0, -1);
+    }
+    var type = normType(fd[1]), base = type.replace(/\?$/, ''), out = [fd[0], type];
+    if (base === 'struct') out.push(normFields(fd[2]));
+    else if (base === 'bits') out.push(fd[2].map(function (b) { return [b[0], b[1]]; }));
+    else if (base === 'enum' || base === 'set') out.push(fd[2].slice());
+    else if (base === 'fixed') out.push(fd[2]);
+    else if (base === 'const') out.push(normType(fd[2]), fd[3]);
+    else if (base === 'map') {
+        out.push(normType(fd[2]), normType(fd[3]));
+        if (fd[3] === 'struct') out.push(normFields(fd[4]));
+    } else if (base === 'array') {
+        var item = normType(fd[2]), k = 3;
+        out.push(item);
+        if (item === 'struct') out.push(normFields(fd[k++]));
+        else if (item === 'enum' || item === 'set') out.push(fd[k++].slice());
+        else if (item === 'bits') out.push(fd[k++].map(function (b) { return [b[0], b[1]]; }));
+        else if (item === 'fixed') out.push(fd[k++]);
+        if (typeof fd[k] === 'number') out.push({ count: fd[k] });
+    } else if (fd[2] && typeof fd[2] === 'object' && !Array.isArray(fd[2])) {
+        // variants: an object's key order is insertion order - sort it away
+        var keys = Object.keys(fd[2]).sort(function (a, b) { return cmpKeys(a, b, false); }), v = [];
+        for (var i = 0; i < keys.length; i++) v.push([keys[i], normFields(fd[2][keys[i]])]);
+        out.push({ variants: v });
+    }
+    return out;
+}
+function canonJSON(x) {
+    if (typeof x === 'bigint') return '{"$bigint":"' + x.toString() + '"}';
+    if (Array.isArray(x)) return '[' + x.map(canonJSON).join(',') + ']';
+    if (x && typeof x === 'object') {
+        var keys = Object.keys(x).sort(function (a, b) { return cmpKeys(a, b, false); });
+        return '{' + keys.map(function (k) { return JSON.stringify(k) + ':' + canonJSON(x[k]); }).join(',') + '}';
+    }
+    if (typeof x === 'number' && !isFinite(x)) return '{"$float":"' + x + '"}';
+    return JSON.stringify(x);   // -0 prints as 0: const -0 and 0 encode alike only for ints
+}
+
+// SHA-256 (FIPS 180-4), small and dependency-free; schemaId is cached, so
+// speed does not matter here.
+var SHA_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+function sha256(msg) {
+    var n = msg.length, padded = new Uint8Array(((n + 9 + 63) >> 6) << 6);
+    padded.set(msg); padded[n] = 0x80;
+    var bitsHi = Math.floor(n / 0x20000000), bitsLo = (n << 3) >>> 0, L = padded.length;
+    padded[L - 8] = bitsHi >>> 24; padded[L - 7] = bitsHi >>> 16; padded[L - 6] = bitsHi >>> 8; padded[L - 5] = bitsHi;
+    padded[L - 4] = bitsLo >>> 24; padded[L - 3] = bitsLo >>> 16; padded[L - 2] = bitsLo >>> 8; padded[L - 1] = bitsLo;
+    var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19], W = new Array(64);
+    for (var off = 0; off < L; off += 64) {
+        for (var t = 0; t < 16; t++) W[t] = (padded[off + 4*t] << 24 | padded[off + 4*t + 1] << 16 | padded[off + 4*t + 2] << 8 | padded[off + 4*t + 3]) | 0;
+        for (t = 16; t < 64; t++) {
+            var x = W[t - 15], y = W[t - 2];
+            var s0 = (x >>> 7 | x << 25) ^ (x >>> 18 | x << 14) ^ (x >>> 3);
+            var s1 = (y >>> 17 | y << 15) ^ (y >>> 19 | y << 13) ^ (y >>> 10);
+            W[t] = (W[t - 16] + s0 + W[t - 7] + s1) | 0;
+        }
+        var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (t = 0; t < 64; t++) {
+            var S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
+            var t1 = (h + S1 + ((e & f) ^ (~e & g)) + SHA_K[t] + W[t]) | 0;
+            var S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
+            var t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+            h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = new Uint8Array(32);
+    for (var i = 0; i < 8; i++) { out[4*i] = H[i] >>> 24; out[4*i + 1] = H[i] >>> 16; out[4*i + 2] = H[i] >>> 8; out[4*i + 3] = H[i]; }
+    return out;
+}
+
+var _ids = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+
+/**
+ * The canonical JSON text that schemaId hashes - for other implementations
+ * and for diffing two schemas that unexpectedly differ.
+ */
+litepack.canonicalSchema = function(schema) {
+    compileDef(schema);            // invalid schemas throw here, not hash
+    return canonJSON(normFields(schema));
+};
+
+/**
+ * Short id of a schema's wire meaning: hex of the first `bytes` (default 8,
+ * 1..32) bytes of SHA-256('litepack-schema-v1\n' + canonicalSchema(schema)).
+ */
+litepack.schemaId = function(schema, bytes) {
+    bytes = bytes === undefined ? 8 : bytes;
+    if (!(bytes >= 1 && bytes <= 32 && bytes % 1 === 0)) throw new RangeError('litepack: schemaId length must be 1..32 bytes');
+    var full = _ids && _ids.get(schema);
+    if (!full) {
+        full = sha256(utf8Encode('litepack-schema-v1\n' + litepack.canonicalSchema(schema)));
+        if (_ids) _ids.set(schema, full);
+    }
+    var h = '';
+    for (var i = 0; i < bytes; i++) h += (full[i] < 16 ? '0' : '') + full[i].toString(16);
+    return h;
+};
 
 litepack.version = '2.0.0';
 

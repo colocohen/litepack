@@ -446,6 +446,10 @@ correctly across as many bytes as needed. Every subfield must be present
 and fit its width (`mode: 8` in 3 bits throws instead of becoming `0`);
 `true`/`false` count as 1/0. Unused padding bits must decode as zero.
 
+On the wire the subfields form one big-endian integer, first subfield most
+significant, padding in the top bits of the first byte — the same layout at
+every width (see [SPEC.md](SPEC.md) §5).
+
 ### Struct (Nested)
 
 ```js
@@ -506,6 +510,10 @@ var msgProto = [
 litepack.encode(msgProto, { seq: 1, kind: 3, lat: 32.08, lon: 34.78 });
 // decode reads `kind`, then parses only the matching branch — flat object out
 ```
+
+Branch fields land in the same object as the parent's, so a name may appear
+once across a struct and its branches (sibling branches may share one);
+`compile` throws on a repeat.
 
 ### Optional Fields
 
@@ -588,7 +596,7 @@ if (!msg) return;              // hostile/corrupt input handled, done
 
 ### Precompiled handles
 
-#### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength }`
+#### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength, schemaId }`
 
 ```js
 var Cert = litepack.compile(certProto);
@@ -606,6 +614,28 @@ via `WeakMap` — your schema array is never mutated and frozen schemas work.
 `compile()` just makes call sites tidier. Either way: **define schemas once
 at module level** and reuse the array — the cache is keyed by identity, so
 re-parsing a schema from JSON on every call recompiles every time.
+
+### Schema identity
+
+#### `litepack.schemaId(schema, bytes = 8)` → hex `string`
+
+The wire carries no type information, so two peers holding different
+schemas decode each other's messages into garbage — silently. `schemaId`
+names a schema by what it means on the wire; exchange it in a handshake, or
+store it beside saved data, and compare before decoding:
+
+```js
+litepack.schemaId(presenceProto);         // 'ffd9567e11474c51'
+Presence.schemaId();                      // same, from a compiled handle
+litepack.canonicalSchema(presenceProto);  // the exact text that was hashed
+```
+
+Same id ⇔ same bytes into the same object shape. Field names, types,
+optional markers, enum/set options and their order, widths and lengths all
+count; `{default}` options, alias spelling (`timestamp`/`varint`) and the
+key order of a variants object do not. Custom codecs count by name only —
+rename a codec when you change its encoding. Cached per schema; SHA-256 is
+built in (no dependency). Definition: [SPEC.md](SPEC.md) §10.
 
 ### Sizing & validation
 
@@ -930,6 +960,15 @@ the error.
 succeeds then `encode(schema, result)` returns exactly `bytes`. The test
 suite checks it on 10,000 corrupted messages per run.
 
+**Hostile names:** a map key `"__proto__"` from the wire is stored as an
+ordinary own key (1.x let it replace the object's prototype), and schemas
+cannot name a field `__proto__`.
+
+**Other languages:** [SPEC.md](SPEC.md) defines the wire format byte by
+byte, and `spec/vectors.json` holds 110+ vectors (valid messages, messages
+that must be rejected, values that must be refused, schema ids). A port
+conforms when it passes them all.
+
 **Defaults:** where safety costs speed, speed is the default and safety an
 option (`{copy:true}`, `{bigint:true}`); where it costs nothing, safety is
 the default.
@@ -990,8 +1029,15 @@ litepack.encode(schema, data);                             // reuse the array
 
 The **wire format is unchanged** for valid data: every message 1.2.2
 encodes, 2.0 encodes to the same bytes (tested on 2,000 random messages) —
-except maps, whose keys are now written in sorted order. What changes is
-what is *accepted*:
+with two exceptions:
+
+* **maps** write their keys in sorted order;
+* **bits fields wider than 31 bits** are laid out like the narrower ones
+  (padding in the top bits of the first byte; 1.x put it in the low bits of
+  the last byte, so adding a subfield that crossed 31 bits moved every
+  existing one). Fields of up to 31 bits are unchanged.
+
+What changes is what is *accepted*:
 
 * **encode throws where 1.x guessed:** missing required fields (were zero
   values), wrong JS types (`'5'` or `5n` as `varint` were `0`), non-integers
@@ -1009,10 +1055,14 @@ what is *accepted*:
   `{bigint: true}` for BigInt (1.x mixed the two by value).
 * **A leading U+FEFF in a string is kept** (1.x's decoder dropped it).
 * **`codec()` refuses built-in type names.**
+* **`compile` refuses** a field name used twice in a struct and its variant
+  branches (1.x encoded both and decoded the second), repeated enum/set
+  options or bits subfield names, and the name `__proto__`.
 * **`assertComplete`** now covers nested structures and no longer asks for
   `const` fields.
 * New: arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
-  compiled handles, `{extensible}`, `{bigint}`.
+  compiled handles, `{extensible}`, `{bigint}`, `schemaId`,
+  `canonicalSchema`, [SPEC.md](SPEC.md) with test vectors.
 
 ## 🔄 Migrating from 1.0
 
@@ -1046,6 +1096,10 @@ litepack.d.ts           — TypeScript declarations (editor autocomplete; needs 
 litepack.test.js        — core test suite (1.x; expectations of coercion need updating)
 litepack.chain.test.js  — streaming/composition test suite
 litepack.v2.test.js     — 2.0: strict encode/decode, options, wire compatibility, canonical fuzz
+SPEC.md                 — the wire format, byte by byte (for ports to other languages)
+spec/vectors.json       — test vectors: valid, must-reject, must-refuse, schema ids
+spec/vectors.test.js    — runs the vectors against litepack.js (node --test spec/vectors.test.js)
+spec/gen-vectors.js     — regenerates vectors.json (asserts the hand-written hex first)
 bench.js                — node bench.js <old build> <new build>
 litepack-tool.html      — interactive schema builder & tester
 ```
@@ -1057,7 +1111,8 @@ The six mistakes everyone makes once — read this and make zero:
 **1. Field order IS the protocol.** There are no field names or tags on the
 wire. If the sender's schema says `[id, name]` and the receiver's says
 `[name, id]`, you get garbage — both sides must use the *identical* schema.
-Share it as a module or JSON file; never retype it.
+Share it as a module or JSON file; never retype it — and compare
+`litepack.schemaId(schema)` in your handshake to catch a mismatch.
 
 **2. Decoded `bytes`/`fixed`/`uuid`/`tail` are views.** They point into
 the input buffer. If you recycle that buffer (common with sockets), your
