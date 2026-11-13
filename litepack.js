@@ -628,6 +628,42 @@ TYPES.tail = {
     }
 };
 
+// Ascending — a set of non-negative integers as a strictly ascending array,
+// stored as gaps: count, first value, then (v[i] - v[i-1] - 1) each. Every
+// byte string of minimal varints decodes to a strictly ascending array, so
+// the type is canonical by construction; small gaps cost one byte each.
+TYPES.ascending = {
+    size: null,
+    write: function(v, buf, pos) {
+        if (!Array.isArray(v)) throw new TypeError('litepack: ascending expects an array, got ' + (v === null ? 'null' : typeof v));
+        var start = pos, prev = -1;
+        pos += writeVarint(v.length, buf, pos);
+        for (var i = 0; i < v.length; i++) {
+            var x = v[i];
+            if (typeof x !== 'number' || !Number.isSafeInteger(x) || x < 0) throw new Error('litepack: ascending item ' + i + ' (' + x + ') is not a non-negative safe integer');
+            if (x <= prev) throw new Error('litepack: ascending item ' + i + ' (' + x + ') is not above the previous (' + prev + ')');
+            pos += writeVarint(x - prev - 1, buf, pos);
+            prev = x;
+        }
+        return pos - start;
+    },
+    read: function(buf, pos) {
+        var start = pos, count = readVarint(buf, pos);
+        pos += _n;
+        if (count > buf.length - pos) throw truncErr('litepack: ascending at byte ' + start + ' needs more bytes (count ' + count + ', ' + (buf.length - pos) + ' remain)');
+        var out = new Array(count), prev = -1;
+        for (var i = 0; i < count; i++) {
+            var g = readVarint(buf, pos);
+            pos += _n;
+            prev = prev + g + 1;
+            if (prev > 9007199254740991) throw new Error('litepack: ascending at byte ' + start + ' climbs past 2^53-1');
+            out[i] = prev;
+        }
+        _n = pos - start;
+        return out;
+    }
+};
+
 // Compiled per field — bits, enum, set, fixed, struct, array
 TYPES.bits = { size: null };
 TYPES.enum = { size: null };
@@ -649,15 +685,61 @@ for (var _p = 0; _p <= 53; _p++) POW2.push(Math.pow(2, _p));
 // a real message instead of "f.write is not a function" at encode time.
 var NEEDS_DEF = { bits: 1, 'enum': 1, set: 1, fixed: 1, struct: 1, array: 1, map: 1, 'const': 1 };
 
-var KNOWN_OPTIONS = { 'default': 1 };
+var KNOWN_OPTIONS = { 'default': 1, min: 1, max: 1 };
 function isOptionsObject(o) {
     var any = false;
     for (var k in o) {
         if (!o.hasOwnProperty(k)) continue;
         if (!KNOWN_OPTIONS[k]) return false;
+        // a variants object keyed 'min'/'max' holds field lists, not bounds
+        if ((k === 'min' || k === 'max') && typeof o[k] !== 'number' && typeof o[k] !== 'bigint') return false;
         any = true;
     }
     return any;
+}
+
+// ── Limits: {min, max} ──────────────────────────────────────
+// On a length type they bound the length/count written on the wire (string:
+// UTF-8 bytes); on a number type, the value. Checked on encode AND decode -
+// a peer's 10 MB string is refused before it is decoded - in strict and
+// extensible mode alike: limits are part of the schema (and its schemaId).
+var LENGTH_TYPES = { string: 1, bytes: 1, array: 1, map: 1, ascending: 1 };
+var NUMBER_TYPES = { varint: 1, svarint: 1, uint8: 1, int8: 1, uint16: 1, int16: 1, uint32: 1, int32: 1,
+                     uint64: 1, int64: 1, float32: 1, float64: 1 };
+
+function limitsOf(opts) {
+    if (!opts || (!opts.hasOwnProperty('min') && !opts.hasOwnProperty('max'))) return null;
+    return { min: opts.hasOwnProperty('min') ? opts.min : null, max: opts.hasOwnProperty('max') ? opts.max : null };
+}
+
+function applyLimits(f, lim) {
+    var nm = f.name, lo = lim.min, hi = lim.max;
+    if (lo !== null && hi !== null && lo > hi) throw new Error("litepack: field '" + nm + "' — min " + lo + ' is above max ' + hi);
+    var w = f.write, r = f.read;
+    if (LENGTH_TYPES[f.type]) {
+        if (f.type === 'array' && f.arrayFixedCount !== null) throw new Error("litepack: field '" + nm + "' — a fixed-count array cannot take min/max");
+        if ((lo !== null && (lo < 0 || lo % 1)) || (hi !== null && (hi < 0 || hi % 1))) throw new Error("litepack: field '" + nm + "' — length limits must be non-negative integers");
+        var what = f.type === 'string' || f.type === 'bytes' ? 'length' : 'count';
+        var check = function(n, pos) {
+            if (hi !== null && n > hi) throw new Error("litepack: field '" + nm + "' — " + what + ' ' + n + ' over max ' + hi + ' at byte ' + pos);
+            if (lo !== null && n < lo) throw new Error("litepack: field '" + nm + "' — " + what + ' ' + n + ' under min ' + lo + ' at byte ' + pos);
+        };
+        // the length/count is the varint the field starts with - read it back
+        // after writing, and peek it before decoding anything else
+        f.write = function(val, buf, pos) { var k = w(val, buf, pos); check(readVarint(buf, pos), pos); return k; };
+        f.read = function(buf, pos) { check(readVarint(buf, pos), pos); return r(buf, pos); };
+    } else if (NUMBER_TYPES[f.type]) {
+        var range = function(v, where) {
+            // !(v >= lo) also catches NaN: a bounded number is a number
+            if ((lo !== null && !(v >= lo)) || (hi !== null && !(v <= hi))) {
+                throw new Error("litepack: field '" + nm + "' — value " + v + ' outside ' + (lo === null ? '' : lo) + '..' + (hi === null ? '' : hi) + where);
+            }
+        };
+        f.write = function(val, buf, pos) { if (typeof val === 'number' || typeof val === 'bigint') range(val, ''); return w(val, buf, pos); };
+        f.read = function(buf, pos) { var v = r(buf, pos); range(v, ' at byte ' + pos); return v; };
+    } else {
+        throw new Error("litepack: field '" + nm + "' — min/max apply to string, bytes, array, map, ascending and number types, not '" + f.type + "'");
+    }
 }
 
 // Defaults may be objects/arrays — each decode gets its OWN copy so
@@ -685,7 +767,7 @@ function compileFields(fieldDefs, nested, seen) {
         var fname = fd[0];
         var ftype = fd[1];
         var optional = false;
-        var f0default, f0hasDefault = false;
+        var f0default, f0hasDefault = false, f0limits = null;
 
         if (typeof ftype !== 'string') {
             throw new Error("litepack: field '" + fname + "' — type must be a string, got " + typeof ftype);
@@ -709,6 +791,7 @@ function compileFields(fieldDefs, nested, seen) {
                     f0default = lastEl['default'];
                     f0hasDefault = true;
                 }
+                f0limits = limitsOf(lastEl);
             }
         }
 
@@ -861,6 +944,7 @@ function compileFields(fieldDefs, nested, seen) {
             f.fixedSize = typeDef.size;
         }
 
+        if (f0limits) applyLimits(f, f0limits);
         fields.push(f);
     }
 
@@ -1400,6 +1484,15 @@ function estimateSingleField(f, val) {
             return varintSize(len) + len;
         case 'varint':
             return varintSize(val || 0);
+        case 'ascending':
+            if (!Array.isArray(val)) return 1;            // invalid: the writer throws
+            var as = varintSize(val.length), ap = -1;
+            for (var j = 0; j < val.length; j++) {
+                var ax = val[j];
+                as += (typeof ax === 'number' && ax > ap) ? varintSize(ax - ap - 1) : 1;
+                ap = ax;
+            }
+            return as;
         case 'svarint':
             return varintSize(zigzag(Math.round(typeof val === 'number' ? val : 0)));
         case 'enum':
@@ -1634,8 +1727,7 @@ litepack.compile = function(schema, copts) {
         },
         byteLength: function(data) {
             return estimateFieldSize(c.fields, c.optionalCount, data || {});
-        },
-        schemaId: function(bytes) { return litepack.schemaId(schema, bytes); }
+        }
     };
 };
 
@@ -1841,7 +1933,8 @@ BUILTIN.timestamp = true;
 // to find out that they disagree BEFORE decoding garbage - litepack messages
 // carry no type information, so a mismatch is otherwise silent.
 //
-// Hashed: the canonical JSON below, prefixed 'litepack-schema-v1\n', SHA-256.
+// Hashed: the canonical JSON below, prefixed 'litepack-schema-v1\n', with
+// MurmurHash3-32 (schemaId); schemaBytes hands the same bytes to any hash.
 // In:  field and subfield names, types (aliases resolved), '?' markers,
 //      enum/set option names and order, bits widths, fixed lengths, array
 //      fixed counts, const base+value, map key/value types, variant keys.
@@ -1860,10 +1953,22 @@ function normFields(fds) {
     return out;
 }
 function normField(fd) {
+    var lim = null;
     if (fd.length > 2) {
         var last = fd[fd.length - 1];
-        if (last && typeof last === 'object' && !Array.isArray(last) && isOptionsObject(last)) fd = fd.slice(0, -1);
+        if (last && typeof last === 'object' && !Array.isArray(last) && isOptionsObject(last)) { fd = fd.slice(0, -1); lim = limitsOf(last); }
     }
+    var out = normField2(fd);
+    // limits change which bytes are accepted, so they are part of the id
+    if (lim) {
+        var l = {};
+        if (lim.min !== null) l.min = lim.min;
+        if (lim.max !== null) l.max = lim.max;
+        out.push({ limits: l });
+    }
+    return out;
+}
+function normField2(fd) {
     var type = normType(fd[1]), base = type.replace(/\?$/, ''), out = [fd[0], type];
     if (base === 'struct') out.push(normFields(fd[2]));
     else if (base === 'bits') out.push(fd[2].map(function (b) { return [b[0], b[1]]; }));
@@ -1900,74 +2005,53 @@ function canonJSON(x) {
     return JSON.stringify(x);   // -0 prints as 0: const -0 and 0 encode alike only for ints
 }
 
-// SHA-256 (FIPS 180-4), small and dependency-free; schemaId is cached, so
-// speed does not matter here.
-var SHA_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-function sha256(msg) {
-    var n = msg.length, padded = new Uint8Array(((n + 9 + 63) >> 6) << 6);
-    padded.set(msg); padded[n] = 0x80;
-    var bitsHi = Math.floor(n / 0x20000000), bitsLo = (n << 3) >>> 0, L = padded.length;
-    padded[L - 8] = bitsHi >>> 24; padded[L - 7] = bitsHi >>> 16; padded[L - 6] = bitsHi >>> 8; padded[L - 5] = bitsHi;
-    padded[L - 4] = bitsLo >>> 24; padded[L - 3] = bitsLo >>> 16; padded[L - 2] = bitsLo >>> 8; padded[L - 1] = bitsLo;
-    var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19], W = new Array(64);
-    for (var off = 0; off < L; off += 64) {
-        for (var t = 0; t < 16; t++) W[t] = (padded[off + 4*t] << 24 | padded[off + 4*t + 1] << 16 | padded[off + 4*t + 2] << 8 | padded[off + 4*t + 3]) | 0;
-        for (t = 16; t < 64; t++) {
-            var x = W[t - 15], y = W[t - 2];
-            var s0 = (x >>> 7 | x << 25) ^ (x >>> 18 | x << 14) ^ (x >>> 3);
-            var s1 = (y >>> 17 | y << 15) ^ (y >>> 19 | y << 13) ^ (y >>> 10);
-            W[t] = (W[t - 16] + s0 + W[t - 7] + s1) | 0;
-        }
-        var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
-        for (t = 0; t < 64; t++) {
-            var S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
-            var t1 = (h + S1 + ((e & f) ^ (~e & g)) + SHA_K[t] + W[t]) | 0;
-            var S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
-            var t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
-            h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
-        }
-        H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
-        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+// MurmurHash3, 32-bit (x86_32, seed 0) - small, fast in JS (Math.imul), and
+// in every language. Not cryptographic: the id catches an accidental
+// mismatch. Hash schemaBytes() yourself for anything else.
+function murmur3(b) {
+    var n = b.length, h = 0, i = 0, k;
+    for (; i + 4 <= n; i += 4) {
+        k = b[i] | b[i + 1] << 8 | b[i + 2] << 16 | b[i + 3] << 24;
+        k = Math.imul(k, 0xCC9E2D51); k = k << 15 | k >>> 17; k = Math.imul(k, 0x1B873593);
+        h ^= k; h = h << 13 | h >>> 19; h = (Math.imul(h, 5) + 0xE6546B64) | 0;
     }
-    var out = new Uint8Array(32);
-    for (var i = 0; i < 8; i++) { out[4*i] = H[i] >>> 24; out[4*i + 1] = H[i] >>> 16; out[4*i + 2] = H[i] >>> 8; out[4*i + 3] = H[i]; }
-    return out;
+    k = 0;
+    switch (n & 3) {
+        case 3: k ^= b[i + 2] << 16;
+        case 2: k ^= b[i + 1] << 8;
+        case 1: k ^= b[i];
+            k = Math.imul(k, 0xCC9E2D51); k = k << 15 | k >>> 17; k = Math.imul(k, 0x1B873593); h ^= k;
+    }
+    h ^= n;
+    h ^= h >>> 16; h = Math.imul(h, 0x85EBCA6B);
+    h ^= h >>> 13; h = Math.imul(h, 0xC2B2AE35);
+    h ^= h >>> 16;
+    return h >>> 0;
 }
 
 var _ids = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
-
-/**
- * The canonical JSON text that schemaId hashes - for other implementations
- * and for diffing two schemas that unexpectedly differ.
- */
-litepack.canonicalSchema = function(schema) {
-    compileDef(schema);            // invalid schemas throw here, not hash
-    return canonJSON(normFields(schema));
-};
-
-/**
- * Short id of a schema's wire meaning: hex of the first `bytes` (default 8,
- * 1..32) bytes of SHA-256('litepack-schema-v1\n' + canonicalSchema(schema)).
- */
-litepack.schemaId = function(schema, bytes) {
-    bytes = bytes === undefined ? 8 : bytes;
-    if (!(bytes >= 1 && bytes <= 32 && bytes % 1 === 0)) throw new RangeError('litepack: schemaId length must be 1..32 bytes');
-    var full = _ids && _ids.get(schema);
-    if (!full) {
-        full = sha256(utf8Encode('litepack-schema-v1\n' + litepack.canonicalSchema(schema)));
-        if (_ids) _ids.set(schema, full);
+function idEntry(schema) {
+    var e = _ids && _ids.get(schema);
+    if (!e) {
+        compileDef(schema);            // an invalid schema throws here, not hashes
+        var input = utf8Encode('litepack-schema-v1\n' + canonJSON(normFields(schema)));
+        e = { input: input, id: murmur3(input) };
+        if (_ids) _ids.set(schema, e);
     }
-    var h = '';
-    for (var i = 0; i < bytes; i++) h += (full[i] < 16 ? '0' : '') + full[i].toString(16);
-    return h;
-};
+    return e;
+}
+
+/**
+ * The schema's id: MurmurHash3-32 of schemaBytes(schema), a number in
+ * [0, 2^32). Same id = same bytes into the same object shape. Cached.
+ */
+litepack.schemaId = function(schema) { return idEntry(schema).id; };
+
+/**
+ * The bytes schemaId hashes - 'litepack-schema-v1\n' + the canonical JSON of
+ * the schema, UTF-8. Hash them with any function you like.
+ */
+litepack.schemaBytes = function(schema) { return idEntry(schema).input.slice(); };
 
 litepack.version = '2.0.0';
 

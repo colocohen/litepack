@@ -212,11 +212,13 @@ delimiters, no type tags — the schema on both sides is the contract.
 | `const` | = base type | protocol constants — auto-written, verified |
 | `struct` | inline | nested object |
 | `array` | count + items | lists, incl. arrays of structs |
+| `ascending` | count + gaps | sorted sets of integers (ids, ranges, indices) |
 | `map` | count + pairs | dynamic keys, typed values |
 | `json` | len + JSON | free-form escape hatch |
 | *(custom)* | len + codec | anything via `litepack.codec()` |
 
-Any type + `?` = optional (zero bytes when absent).
+Any type + `?` = optional (zero bytes when absent). Lengths, counts and
+numbers take `{min, max}` limits (see [Limits](#limits-min--max)).
 
 ### Integers
 
@@ -492,6 +494,21 @@ There is **no need** to pre-encode struct entries into an `array` of
 nested arrays inside) work natively, and cost one length prefix *less* per
 entry than the manual wrapping trick.
 
+### Ascending (sorted integer sets)
+
+```js
+['ids', 'ascending']        // [3, 4, 10, 1000] → 04 03 00 05 dd 07 (6 bytes)
+```
+
+A strictly ascending array of non-negative integers (≤ 2^53−1), stored as a
+count, the first value, then each gap minus one. Neighbouring values cost a
+byte each however large they are — `[1000000, 1000001]` is 5 bytes against 7
+for `array varint`. Encode refuses a repeated or descending value; decode
+cannot produce one (any bytes decode to an ascending array), so the type is
+canonical by construction. Good for id sets, sorted indices, and range
+boundaries `[start0, end0, start1, end1, …]` of non-touching ranges.
+Faster than an array of `{gap, len}` structs (≈3× on encode and decode).
+
 ### Variants (Tagged Union)
 
 Different fields depending on a discriminator — one schema for a whole
@@ -543,6 +560,29 @@ encode, absent still costs zero bytes. This is the painless way to evolve
 schemas: add `['battery','uint8?',{default:100}]` and every old message
 decodes with a sensible value — no `=== undefined` checks scattered
 through your code.
+
+### Limits (`min` / `max`)
+
+The same options object bounds lengths, counts and numbers:
+
+```js
+['name',  'string',  {max: 64}]              // UTF-8 bytes, not characters
+['tags',  'array', 'string', {max: 16}]      // item count
+['meta',  'map', 'string', 'string', {max: 32}]
+['ids',   'ascending', {max: 512}]
+['qty',   'varint',  {min: 1, max: 1000}]
+['temp',  'float32', {min: -50, max: 60}]    // NaN is outside any range
+['nick',  'string?', {max: 20, default: ''}] // with ? and default
+```
+
+Checked on encode **and** decode, in strict and extensible mode alike: a
+peer's 10 MB string is refused by its length prefix, before it is decoded.
+This is the defence against oversized messages from the network — the
+schema says what a valid message is, and the decoder enforces it at the cost
+of one comparison. Limits are part of the schema's `schemaId`; `default` is
+not. Not for fixed-size types (`bool`, `fixed`, `enum`…) or fixed-count
+arrays, where they would mean nothing (compile error). Item limits for an
+array of strings: wrap the item in a struct.
 
 ## 📚 API
 
@@ -596,7 +636,7 @@ if (!msg) return;              // hostile/corrupt input handled, done
 
 ### Precompiled handles
 
-#### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength, schemaId }`
+#### `litepack.compile(schema, options?)` → `{ encode, decode, tryDecode, byteLength }`
 
 ```js
 var Cert = litepack.compile(certProto);
@@ -617,7 +657,7 @@ re-parsing a schema from JSON on every call recompiles every time.
 
 ### Schema identity
 
-#### `litepack.schemaId(schema, bytes = 8)` → hex `string`
+#### `litepack.schemaId(schema)` → `number`
 
 The wire carries no type information, so two peers holding different
 schemas decode each other's messages into garbage — silently. `schemaId`
@@ -625,17 +665,28 @@ names a schema by what it means on the wire; exchange it in a handshake, or
 store it beside saved data, and compare before decoding:
 
 ```js
-litepack.schemaId(presenceProto);         // 'ffd9567e11474c51'
-Presence.schemaId();                      // same, from a compiled handle
-litepack.canonicalSchema(presenceProto);  // the exact text that was hashed
+litepack.schemaId([['id','varint'], ['name','string']]);   // 589299480
 ```
 
-Same id ⇔ same bytes into the same object shape. Field names, types,
-optional markers, enum/set options and their order, widths and lengths all
-count; `{default}` options, alias spelling (`timestamp`/`varint`) and the
-key order of a variants object do not. Custom codecs count by name only —
-rename a codec when you change its encoding. Cached per schema; SHA-256 is
-built in (no dependency). Definition: [SPEC.md](SPEC.md) §10.
+A number from 0 to 2^32−1: MurmurHash3 (32-bit, seed 0) of the schema's
+canonical bytes. Fast (~0.2 µs to hash a typical schema, then cached) and
+not cryptographic — it catches an accidental mismatch, which is its job.
+
+Same schema meaning ⇔ same `schemaBytes` (two different schemas share a 32-bit id about once in 4 billion). Field names, types,
+optional markers, enum/set options and their order, widths, lengths and
+`{min, max}` limits all count; `{default}` options, alias spelling
+(`timestamp`/`varint`) and the key order of a variants object do not.
+Custom codecs count by name only — rename a codec when you change its
+encoding. Definition: [SPEC.md](SPEC.md) §10.
+
+#### `litepack.schemaBytes(schema)` → `Uint8Array`
+
+The exact bytes `schemaId` hashes (`litepack-schema-v1\n` + the schema's
+canonical JSON, UTF-8). For an id from any other hash, hash these:
+
+```js
+crypto.createHash('sha256').update(litepack.schemaBytes(schema)).digest();
+```
 
 ### Sizing & validation
 
@@ -960,12 +1011,16 @@ the error.
 succeeds then `encode(schema, result)` returns exactly `bytes`. The test
 suite checks it on 10,000 corrupted messages per run.
 
+**Oversized input:** give every string, bytes, array and map that comes
+from the network a `{max}` — decode then refuses an oversized field by its
+length prefix, before reading it.
+
 **Hostile names:** a map key `"__proto__"` from the wire is stored as an
 ordinary own key (1.x let it replace the object's prototype), and schemas
 cannot name a field `__proto__`.
 
 **Other languages:** [SPEC.md](SPEC.md) defines the wire format byte by
-byte, and `spec/vectors.json` holds 110+ vectors (valid messages, messages
+byte, and `spec/vectors.json` holds 140+ vectors (valid messages, messages
 that must be rejected, values that must be refused, schema ids). A port
 conforms when it passes them all.
 
@@ -1062,7 +1117,8 @@ What changes is what is *accepted*:
   `const` fields.
 * New: arrays of `fixed` items, `compile(schema, options)`, `tryDecode` on
   compiled handles, `{extensible}`, `{bigint}`, `schemaId`,
-  `canonicalSchema`, [SPEC.md](SPEC.md) with test vectors.
+  `schemaBytes`, the `ascending` type, `{min, max}` limits,
+  [SPEC.md](SPEC.md) with test vectors.
 
 ## 🔄 Migrating from 1.0
 
